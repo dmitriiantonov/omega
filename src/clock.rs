@@ -1,18 +1,18 @@
-use crate::clock::WriteResult::{Inserted, Rejected, Replaced, Retry};
-use crate::core::backoff::Backoff;
+use crate::clock::WriteResult::{Rejected, Retry, Written};
+use crate::core::backoff::BackoffConfig;
 use crate::core::engine::CacheEngine;
 use crate::core::entry::Entry;
-use crate::core::handler::Handler;
+use crate::core::handler::EntryRef;
 use crate::core::key::Key;
-use Clock::{Claimed, Cold, Hot, Vacant};
+use SlotState::{Claimed, Cold, Hot, Vacant};
 use crossbeam::epoch::{Atomic, Guard, Owned, pin};
 use dashmap::DashMap;
 use std::borrow::Borrow;
 use std::hash::Hash;
-use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicU8, AtomicUsize};
+use std::time::Instant;
 
 /// Represents the state of a slot in the Clock cache.
 ///
@@ -24,15 +24,15 @@ use std::sync::atomic::{AtomicU8, AtomicUsize};
 /// - `Claimed` → temporary state during write; readers treat it as empty.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Clock {
+enum SlotState {
     Vacant = 0,
     Cold = 1,
     Hot = 2,
     Claimed = 3,
 }
 
-impl From<Clock> for u8 {
-    fn from(clock: Clock) -> Self {
+impl From<SlotState> for u8 {
+    fn from(clock: SlotState) -> Self {
         match clock {
             Vacant => 0,
             Cold => 1,
@@ -42,7 +42,7 @@ impl From<Clock> for u8 {
     }
 }
 
-impl From<u8> for Clock {
+impl From<u8> for SlotState {
     fn from(clock: u8) -> Self {
         match clock {
             0 => Vacant,
@@ -54,19 +54,13 @@ impl From<u8> for Clock {
     }
 }
 
-/// Result of attempting to write into a slot.
-///
-/// - `Inserted`: entry successfully inserted into an empty slot.
-/// - `Replaced`: old entry with the same key replaced; returned handler provides access.
-/// - `Retry`: slot unavailable (hot or claimed); caller should retry.
 #[derive(Debug)]
 enum WriteResult<K, V>
 where
     K: Eq + Hash,
 {
-    Inserted,
-    Replaced(Handler<K, V>),
-    Retry,
+    Written,
+    Retry(Entry<K, V>),
     Rejected,
 }
 
@@ -81,7 +75,7 @@ where
     /// The atomic entry stored in the slot.
     entry: Atomic<Entry<K, V>>,
     /// The clock state for eviction logic.
-    clock: AtomicU8,
+    state: AtomicU8,
 }
 
 impl<K, V> Slot<K, V>
@@ -92,7 +86,7 @@ where
     fn empty() -> Self {
         Self {
             entry: Atomic::default(),
-            clock: AtomicU8::new(Vacant.into()),
+            state: AtomicU8::new(Vacant.into()),
         }
     }
 
@@ -103,12 +97,12 @@ where
     ///
     /// # Safety
     /// The returned handler holds a pinned guard ensuring safe access.
-    fn load<Q>(&self, key: &Q, guard: Guard) -> Option<Handler<K, V>>
+    fn load<Q>(&self, key: &Q, guard: Guard) -> Option<EntryRef<K, V>>
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        let state = self.load_clock();
+        let state = self.state();
 
         match state {
             Vacant | Claimed => None,
@@ -120,7 +114,7 @@ where
 
                 let entry = unsafe { shared_entry.deref() };
 
-                if entry.key().borrow() != key {
+                if entry.key().borrow() != key || entry.is_expired() {
                     return None;
                 }
 
@@ -128,7 +122,7 @@ where
                     self.upgrade();
                 }
 
-                Some(Handler::new(NonNull::from(entry), guard))
+                Some(EntryRef::new(NonNull::from(entry), guard))
             }
         }
     }
@@ -151,7 +145,7 @@ where
     /// - Old entry is either deferred for destruction or returned as a handler.
     fn try_write<A, E, I>(
         &self,
-        entry: &MaybeUninit<Entry<K, V>>,
+        entry: Entry<K, V>,
         guard: Guard,
         admission: A,
         on_evict: E,
@@ -162,80 +156,84 @@ where
         E: for<'a> FnOnce(&'a Key<K>),
         I: for<'a> FnOnce(&'a Key<K>),
     {
-        let state = self.load_clock();
-        let key = unsafe { entry.assume_init_ref().key() };
+        let state = self.state();
 
-        match state {
-            Vacant | Cold => {
-                if self
-                    .clock
-                    .compare_exchange_weak(state.into(), Claimed.into(), Relaxed, Relaxed)
-                    .is_err()
-                {
-                    return Retry;
-                }
-
-                let shared_old_entry = self.entry.load(Relaxed, &guard);
-
-                let replaced_entry = match unsafe { shared_old_entry.as_ref() } {
-                    Some(old_entry) => {
-                        if !admission(key.as_ref(), old_entry.key().as_ref()) {
-                            self.store_state(state);
-                            return Rejected;
-                        }
-
-                        on_evict(old_entry.key());
-                        unsafe { guard.defer_destroy(shared_old_entry) };
-
-                        if old_entry.key() == key {
-                            Some(Handler::new(NonNull::from(old_entry), guard))
-                        } else {
-                            None
-                        }
-                    }
-                    None => None,
-                };
-
-                let entry = unsafe { entry.assume_init_read() };
-                let key = entry.key().clone();
-
-                self.entry.store(Owned::new(entry), Relaxed);
-                on_insert(&key);
-                self.clock.store(Cold.into(), Release);
-
-                match replaced_entry {
-                    None => Inserted,
-                    Some(x) => Replaced(x),
-                }
-            }
-            Hot => {
+        if !self.is_writable(state, &guard) {
+            if state == Hot {
                 let _ = self.downgrade();
-                Retry
             }
-            Claimed => Retry,
+
+            return Retry(entry);
+        }
+
+        if !self.claim(state) {
+            return Retry(entry);
+        }
+
+        let shared_current_entry = self.entry.load(Acquire, &guard);
+
+        if let Some(current_entry) = unsafe { shared_current_entry.as_ref() } {
+            if !(current_entry.is_expired()
+                || admission(entry.key(), current_entry.key()))
+            {
+                self.store_state(state);
+                return Rejected;
+            }
+
+            on_evict(current_entry.key());
+            unsafe { guard.defer_destroy(shared_current_entry) };
+        }
+
+        let key = entry.key().clone();
+
+        self.entry.store(Owned::new(entry), Relaxed);
+        on_insert(&key);
+        self.state.store(Cold.into(), Release);
+
+        Written
+    }
+
+    #[inline]
+    fn is_writable(&self, state: SlotState, guard: &Guard) -> bool {
+        let shared_entry = self.entry.load(Acquire, guard);
+
+        match unsafe { shared_entry.as_ref() } {
+            Some(entry) if entry.is_expired() => true,
+            None => true,
+            _ => match state {
+                Vacant | Cold => true,
+                Hot | Claimed => false,
+            },
         }
     }
 
+    #[inline]
+    fn claim(&self, state: SlotState) -> bool {
+        self.state
+            .compare_exchange_weak(state.into(), Claimed.into(), Relaxed, Relaxed)
+            .is_ok()
+    }
+
     /// Load the current clock state atomically.
-    fn load_clock(&self) -> Clock {
-        self.clock.load(Acquire).into()
+    fn state(&self) -> SlotState {
+        self.state.load(Acquire).into()
     }
 
     /// Store a new clock state.
-    fn store_state(&self, state: Clock) {
-        self.clock.store(state.into(), Release);
+    fn store_state(&self, state: SlotState) {
+        self.state.store(state.into(), Release);
     }
 
     /// Upgrade a `Cold` entry to `Hot`.
     fn upgrade(&self) -> bool {
-        self.clock
+        self.state
             .compare_exchange_weak(Cold.into(), Hot.into(), Release, Relaxed)
             .is_ok()
     }
 
     /// Downgrade a `Hot` entry to `Cold`.
     fn downgrade(&self) -> bool {
-        self.clock
+        self.state
             .compare_exchange_weak(Hot.into(), Cold.into(), Release, Relaxed)
             .is_ok()
     }
@@ -257,10 +255,9 @@ where
     hand: AtomicUsize,
     /// Capacity mask (capacity must be power-of-two).
     capacity_mask: usize,
-    /// Current number of elements.
-    len: AtomicUsize,
     /// Maximum number of elements.
     capacity: usize,
+    backoff_config: BackoffConfig,
 }
 
 impl<K, V> ClockCache<K, V>
@@ -271,7 +268,7 @@ where
     ///
     /// # Panics
     /// Capacity must be a power-of-two.
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize, backoff_config: BackoffConfig) -> Self {
         let slots = (0..capacity)
             .map(|_| Slot::empty())
             .collect::<Vec<_>>()
@@ -284,8 +281,8 @@ where
             slots,
             hand: Default::default(),
             capacity_mask,
-            len: AtomicUsize::default(),
             capacity,
+            backoff_config,
         }
     }
 }
@@ -297,7 +294,7 @@ where
     /// Get a value by key.
     ///
     /// Returns a `Handler` that pins the entry in memory.
-    fn get<Q>(&self, key: &Q) -> Option<Handler<K, V>>
+    fn get<Q>(&self, key: &Q) -> Option<EntryRef<K, V>>
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
@@ -309,25 +306,16 @@ where
         })
     }
 
-    /// Insert a value into the cache.
-    ///
-    /// - Uses `SlotIter` to find a candidate slot if key not present.
-    /// - Moves ownership from `MaybeUninit` into the slot only on success.
-    fn insert(&self, key: K, value: V) -> Option<Handler<K, V>> {
-        self.insert_with(key, value, |_, _| true)
-    }
-
-    fn insert_with<F>(&self, key: K, value: V, admission: F) -> Option<Handler<K, V>>
+    fn insert_with<F>(&self, key: K, value: V, expired_at: Option<Instant>, admission: F)
     where
         F: Fn(&K, &K) -> bool,
     {
-        let entry = MaybeUninit::new(Entry::new(key, value));
-        let key = unsafe { entry.assume_init_ref().key() };
+        let mut entry = Entry::new(key, value, expired_at);
         let mut iter = SlotIter::new(self);
-        let mut backoff = Backoff::new(64, 3);
+        let mut backoff = self.backoff_config.build();
 
         loop {
-            let (index, slot) = match self.index.get(key) {
+            let (index, slot) = match self.index.get(entry.key()) {
                 None => iter.next().expect("cache has at least one slot"),
                 Some(reference) => {
                     let index = *reference.value();
@@ -339,7 +327,7 @@ where
             let guard = pin();
 
             match slot.try_write(
-                &entry,
+                entry,
                 guard,
                 &admission,
                 |key| {
@@ -349,78 +337,25 @@ where
                     self.index.insert(key.clone(), index);
                 },
             ) {
-                Inserted => {
-                    self.len.fetch_add(1, Relaxed);
-                    return None;
+                Written | Rejected => break,
+                Retry(passed_entry) => {
+                    backoff.backoff();
+                    entry = passed_entry
                 }
-                Replaced(handler) => return Some(handler),
-                Retry => {
-                    backoff.snooze();
-                }
-                Rejected => return None,
             };
         }
     }
 
-    /// Remove a key from the cache.
-    ///
-    /// Returns a handler if the entry exists, pinned with a guard.
-    fn remove<Q>(&self, key: &Q) -> Option<Handler<K, V>>
+    fn remove<Q>(&self, key: &Q) -> bool
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        self.index.remove(key).and_then(|(_, index)| {
-            let slot = &self.slots[index];
-            let guard = pin();
-
-            let shared = slot.entry.load(Relaxed, &guard);
-
-            match unsafe { shared.as_ref() } {
-                Some(entry) if entry.key().borrow() == key => {
-                    Some(Handler::new(NonNull::from(entry), guard))
-                }
-                _ => None,
-            }
-        })
+        self.index.remove(key).is_some()
     }
 
-    /// Number of elements currently stored.
     fn capacity(&self) -> usize {
-        self.len.load(Relaxed)
-    }
-
-    /// Maximum capacity of the cache.
-    fn len(&self) -> usize {
         self.capacity
-    }
-
-    /// Check if cache has space for a new entry.
-    fn has_space(&self) -> bool {
-        self.len() < self.capacity()
-    }
-
-    /// Peek a candidate for eviction using the clock hand.
-    fn peek_victim(&self) -> Option<Handler<K, V>> {
-        let mut current = self.hand.load(Acquire);
-        let n = self.slots.len();
-        let guard = pin();
-
-        for _ in 0..n {
-            let slot = &self.slots[current];
-            let clock = slot.load_clock();
-
-            if clock == Cold {
-                let shared_entry = slot.entry.load(Relaxed, &guard);
-                let entry = unsafe { shared_entry.deref() };
-
-                return Some(Handler::new(NonNull::from(entry), guard));
-            }
-
-            current = (current + 1) & self.capacity_mask;
-        }
-
-        None
     }
 }
 
@@ -467,7 +402,7 @@ where
             {
                 Ok(_) => {
                     let slot = &self.slots[current];
-                    let clock = slot.load_clock();
+                    let clock = slot.state();
 
                     if clock == Claimed {
                         current = next;
@@ -487,338 +422,138 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fake::{Fake, Faker};
-    use std::collections::HashMap;
-    use std::sync::Arc;
+    use fake::Fake;
+    use fake::faker::lorem::en::Word;
+    use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::{Duration, Instant};
 
-    /* ------------------------------------------------------------
-     * Helpers
-     * ---------------------------------------------------------- */
-
-    fn fake_key() -> u64 {
-        Faker.fake()
+    fn backoff_config() -> BackoffConfig {
+        BackoffConfig {
+            policy: crate::core::backoff::BackoffPolicy::Exponential,
+            limit: 10,
+        }
     }
 
-    fn fake_value() -> u64 {
-        Faker.fake()
+    fn generate_data() -> String {
+        Word().fake()
     }
 
-    fn handler_value<K: Eq + Hash, V>(h: &Handler<K, V>) -> &V {
-        h.value()
-    }
-
-    /* ------------------------------------------------------------
-     * Basic behavior (single-threaded)
-     * ---------------------------------------------------------- */
-
+    /// 1. Ghost Reference Safety
+    /// Verifies that EntryRef (Epoch Guard) protects memory even after eviction.
     #[test]
-    fn test_clock_cache_empty_get_returns_none() {
-        let cache: ClockCache<u64, u64> = ClockCache::new(8);
-        let key = fake_key();
+    fn test_ghost_reference_safety() {
+        let cache = Arc::new(ClockCache::new(2, backoff_config()));
+        let (key, value) = (generate_data(), generate_data());
+
+        cache.insert(key.clone(), value.clone(), None);
+
+        let entry_ref = cache.get(&key).expect("key should present");
+
+        for _ in 0..10000 {
+            let (key, value) = (generate_data(), generate_data());
+            cache.insert(key, value, None);
+        }
 
         assert!(cache.get(&key).is_none());
+
+        assert_eq!(entry_ref.value(), &value);
+    }
+
+    /// 2. Second-Chance (Clock) Logic
+    /// Verifies that accessed (Hot) items survive eviction longer than Cold items.
+    #[test]
+    fn test_clock_eviction_priority() {
+        let cache = ClockCache::new(2, backoff_config());
+
+        cache.insert(1, generate_data(), None);
+        cache.insert(2, generate_data(), None);
+
+        let _ = cache.get(&1);
+
+        cache.insert(3, generate_data(), None);
+
+        assert!(
+            cache.get(&1).is_some(),
+            "K1 should have been protected by Hot state"
+        );
+        assert!(
+            cache.get(&2).is_none(),
+            "K2 should have been the first choice for eviction"
+        );
+    }
+
+    /// 3. Admission Policy Rejection
+    /// Verifies that the cache respects the closure's decision to skip an insertion.
+    #[test]
+    fn test_admission_policy_rejection() {
+        let cache = ClockCache::new(10, backoff_config());
+
+        cache.insert(1, "important".to_string(), None);
+
+        cache.insert_with(2, "garbage".to_string(), None, |_, _| false);
+
+        for i in 2..=10 {
+            cache.insert(i, generate_data(), None);
+        }
+
+        cache.insert_with(11, "rejected".to_string(), None, |_, _| false);
+
+        assert!(
+            cache.get(&11).is_none(),
+            "Item should have been rejected by policy"
+        );
+    }
+
+    /// 4. TTL Expiration
+    /// Verifies that the public API hides expired items.
+    #[test]
+    fn test_ttl_expiration() {
+        let cache = ClockCache::new(10, backoff_config());
+        let short_lived = Duration::from_millis(50);
+        let (key, value) = ("key".to_string(), "value".to_string());
+
+        cache.insert(
+            key.clone(),
+            value.clone(),
+            Some(Instant::now() + short_lived),
+        );
+        assert!(cache.get(&key).is_some());
+
+        thread::sleep(Duration::from_millis(100));
+
+        assert!(
+            cache.get(&key).is_none(),
+            "Expired item should not be accessible"
+        );
     }
 
     #[test]
-    fn test_clock_cache_insert_then_get_returns_value() {
-        let cache: ClockCache<u64, u64> = ClockCache::new(8);
-        let key = fake_key();
-        let value = fake_value();
+    fn test_concurrent_hammer() {
+        let cache = Arc::new(ClockCache::new(64, backoff_config()));
+        let threads = 8;
+        let ops = 1000;
+        let barrier = Arc::new(Barrier::new(threads));
 
-        cache.insert(key, value);
-
-        let handler = cache.get(&key).unwrap();
-        assert_eq!(handler.key(), &key);
-        assert_eq!(handler.value(), &value);
-    }
-
-    #[test]
-    fn test_clock_cache_insert_same_key_replaces_value() {
-        let cache: ClockCache<u64, u64> = ClockCache::new(8);
-        let key = fake_key();
-
-        let first = fake_value();
-        let second = fake_value();
-
-        cache.insert(key, first);
-        let replaced = cache.insert(key, second);
-
-        assert!(replaced.is_some());
-
-        let handler = cache.get(&key).unwrap();
-        assert_eq!(*handler_value(&handler), second);
-    }
-
-    #[test]
-    fn test_clock_cache_remove_removes_entry() {
-        let cache: ClockCache<u64, u64> = ClockCache::new(8);
-        let key = fake_key();
-
-        cache.insert(key, fake_value());
-        cache.remove(&key);
-
-        assert!(cache.get(&key).is_none());
-    }
-
-    /* ------------------------------------------------------------
-     * Slot / clock state behavior
-     * ---------------------------------------------------------- */
-
-    #[test]
-    fn test_clock_cache_get_upgrades_cold_entry_to_hot() {
-        let cache: ClockCache<u64, u64> = ClockCache::new(1);
-        let key = fake_key();
-
-        cache.insert(key, fake_value());
-        let slot = &cache.slots[0];
-
-        assert_eq!(slot.load_clock(), Cold);
-
-        let _ = slot.load(&key, pin());
-        assert_eq!(slot.load_clock(), Hot);
-    }
-
-    #[test]
-    fn test_clock_cache_hot_entry_can_be_downgraded() {
-        let cache: ClockCache<u64, u64> = ClockCache::new(1);
-        let key = fake_key();
-
-        cache.insert(key, fake_value());
-        let slot = &cache.slots[0];
-
-        let _ = slot.load(&key, pin());
-        assert_eq!(slot.load_clock(), Hot);
-
-        slot.downgrade();
-        assert_eq!(slot.load_clock(), Cold);
-    }
-
-    #[test]
-    fn test_clock_cache_vacant_slot_has_no_entry() {
-        let cache: ClockCache<u64, u64> = ClockCache::new(1);
-        let slot = &cache.slots[0];
-
-        assert_eq!(slot.load_clock(), Vacant);
-
-        let guard = pin();
-        let entry = slot.entry.load(Relaxed, &guard);
-        assert!(entry.is_null());
-    }
-
-    /* ------------------------------------------------------------
-     * try_write / retry behavior
-     * ---------------------------------------------------------- */
-
-    #[test]
-    fn test_clock_cache_try_write_returns_retry_when_claimed() {
-        let cache: ClockCache<u64, u64> = ClockCache::new(1);
-        let slot = &cache.slots[0];
-
-        slot.store_state(Claimed);
-
-        let entry = MaybeUninit::new(Entry::new(fake_key(), fake_value()));
-        let result = slot.try_write(&entry, pin(), |_, _| true, |_| {}, |_| {});
-
-        assert!(matches!(result, Retry));
-    }
-
-    #[test]
-    fn test_clock_cache_try_write_succeeds_after_retry() {
-        let cache: ClockCache<u64, u64> = ClockCache::new(1);
-        let slot = &cache.slots[0];
-
-        slot.store_state(Vacant);
-
-        let entry = MaybeUninit::new(Entry::new(fake_key(), fake_value()));
-        let result = slot.try_write(&entry, pin(),|_, _| true, |_| {}, |_| {});
-
-        assert!(matches!(result, Inserted));
-    }
-
-    /* ------------------------------------------------------------
-     * Concurrency tests
-     * ---------------------------------------------------------- */
-
-    #[test]
-    fn test_clock_cache_concurrent_insertions_are_visible() {
-        let cache: Arc<ClockCache<u64, u64>> = Arc::new(ClockCache::new(64));
-        let mut expected = HashMap::new();
         let mut handles = vec![];
-
-        for _ in 0..32 {
-            let key = fake_key();
-            let value = fake_value();
-            expected.insert(key, value);
-
+        for t in 0..threads {
             let c = Arc::clone(&cache);
+            let b = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
-                c.insert(key, value);
-            }));
-        }
-
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        for (key, value) in expected {
-            let handler = cache.get(&key).unwrap();
-            assert_eq!(*handler_value(&handler), value);
-        }
-    }
-
-    #[test]
-    fn test_clock_cache_concurrent_insert_and_remove() {
-        let cache: Arc<ClockCache<u64, u64>> = Arc::new(ClockCache::new(64));
-        let keys: Vec<u64> = (0..32).map(|_| fake_key()).collect();
-        let mut handles = vec![];
-
-        for key in keys.clone() {
-            let c = Arc::clone(&cache);
-            handles.push(thread::spawn(move || {
-                c.insert(key, fake_value());
-                c.remove(&key);
-            }));
-        }
-
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        for key in keys {
-            assert!(cache.get(&key).is_none());
-        }
-    }
-
-    #[test]
-    fn test_clock_cache_concurrent_insert_get_consistency() {
-        let cache: Arc<ClockCache<u64, u64>> = Arc::new(ClockCache::new(128));
-        let mut handles = vec![];
-
-        for _ in 0..16 {
-            let c = Arc::clone(&cache);
-            handles.push(thread::spawn(move || {
-                for _ in 0..1_000 {
-                    let key = fake_key();
-                    let value = fake_value();
-
-                    c.insert(key, value);
-
-                    if let Some(handler) = c.get(&key) {
-                        assert_eq!(*handler_value(&handler), value);
-                    }
-                }
-            }));
-        }
-
-        for h in handles {
-            h.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn test_clock_cache_progress_under_high_contention_with_jitter() {
-        const THREADS: usize = 16;
-        const OPS_PER_THREAD: usize = 1_000;
-        const KEY_SPACE: usize = 8; // intentionally tiny → contention
-
-        let cache: Arc<ClockCache<u64, u64>> = Arc::new(ClockCache::new(4));
-
-        let mut handles = Vec::new();
-
-        for thread_id in 0..THREADS {
-            let cache = Arc::clone(&cache);
-
-            handles.push(thread::spawn(move || {
-                for op in 0..OPS_PER_THREAD {
-                    // deterministic but highly colliding
-                    let key = ((thread_id + op) % KEY_SPACE) as u64;
-                    let value = (thread_id as u64) << 32 | op as u64;
-
-                    // insert triggers try_write + Retry + backoff
-                    cache.insert(key, value);
-
-                    // optional read path
-                    if let Some(h) = cache.get(&key) {
-                        // value must be one of the values ever written
-                        let v = *h.value();
-                        let writer_id = (v >> 32) as usize;
-                        assert!(writer_id < THREADS);
-                    }
-                }
-            }));
-        }
-
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        // Final sanity check: cache is still usable
-        for k in 0..KEY_SPACE {
-            let _ = cache.get(&(k as u64));
-        }
-    }
-
-    /* ------------------------------------------------------------
-     * Invariants
-     * ---------------------------------------------------------- */
-
-    #[test]
-    fn test_clock_cache_vacant_slots_have_null_entries_after_stress() {
-        let cache: Arc<ClockCache<u64, u64>> = Arc::new(ClockCache::new(256));
-        let mut handles = vec![];
-
-        for _ in 0..8 {
-            let c = Arc::clone(&cache);
-            handles.push(thread::spawn(move || {
-                for _ in 0..2_000 {
-                    let key = fake_key();
-                    let value = fake_value();
-
-                    c.insert(key, value);
+                b.wait();
+                for i in 0..ops {
+                    let key = (t * 100) + (i % 50); // Mix of private and shared keys
+                    c.insert(key, i, None);
                     let _ = c.get(&key);
+                    if i % 10 == 0 {
+                        c.remove(&key);
+                    }
                 }
             }));
         }
 
         for h in handles {
-            h.join().unwrap();
-        }
-
-        for slot in cache.slots.iter() {
-            if slot.load_clock() == Vacant {
-                let guard = pin();
-                let entry = slot.entry.load(Relaxed, &guard);
-                assert!(entry.is_null());
-            }
-        }
-    }
-
-    /* ------------------------------------------------------------
-     * Drop safety
-     * ---------------------------------------------------------- */
-
-    #[derive(Debug)]
-    struct Droppable(u64);
-
-    impl Drop for Droppable {
-        fn drop(&mut self) {
-            // If this runs without crashes / leaks, epoch GC is correct
-        }
-    }
-
-    #[test]
-    fn test_clock_cache_drop_safety() {
-        let cache: ClockCache<u64, Droppable> = ClockCache::new(16);
-
-        for _ in 0..16 {
-            let key = fake_key();
-            cache.insert(key, Droppable(fake_value()));
-        }
-
-        for _ in 0..16 {
-            let key = fake_key();
-            let _ = cache.remove(&key);
+            h.join().expect("Thread panicked");
         }
     }
 }

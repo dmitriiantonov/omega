@@ -1,118 +1,78 @@
-use crate::core::handler::Handler;
 use crate::core::key::Key;
 use std::borrow::Borrow;
 use std::hash::Hash;
+use std::time::Instant;
+use crate::core::handler::EntryRef;
 
-/// Trait representing a generic cache engine.
+/// A high-performance, concurrent cache engine.
 ///
-/// This trait defines the core operations for a key-value cache, including
-/// insertion, retrieval, removal, and eviction of entries. Implementors of this
-/// trait can define different caching policies such as LRU, LFU, or Clock.
+/// `CacheEngine` provides a thread-safe interface for fixed-capacity caching.
+/// It is designed for systems where throughput is critical, utilizing atomic
+/// state machines and epoch-based memory reclamation to minimize synchronization
+/// overhead.
 ///
-/// # Type Parameters
-///
-/// - `K`: The type of the key. Must implement `Eq` and `Hash`.
-/// - `V`: The type of the value stored in the cache.
+/// # Eviction & Expiration
+/// Implementations typically follow a "Second Chance" (Clock) or LRU policy.
+/// Entries are eligible for eviction if they are marked as 'Cold' or if their
+/// TTL has expired.
 pub trait CacheEngine<K, V>
 where
     K: Eq + Hash,
 {
-    /// Retrieves a cached value corresponding to the given key.
+    /// Retrieves a protected reference to a cached value.
     ///
-    /// Returns an `Option<Handler<K, V>>` containing the cached value if present,
-    /// or `None` if the key is not found in the cache.
+    /// Returns `Some(EntryRef)` if the key exists and is not expired. Accessing
+    /// a key may update its internal recency metadata (e.g., promoting a
+    /// 'Cold' entry to 'Hot').
     ///
-    /// # Type Parameters
-    ///
-    /// - `Q`: A type that can be borrowed from `K` for lookup purposes.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// let cache: MyCache<String, i32> = MyCache::new(10);
-    /// cache.insert("key1".to_string(), 42);
-    /// assert!(cache.get("key1").is_some());
-    /// ```
-    fn get<Q>(&self, key: &Q) -> Option<Handler<K, V>>
+    /// # Memory Safety
+    /// The returned [`EntryRef`] pins the entry in memory using an epoch guard.
+    /// The entry will not be deallocated until the reference is dropped.
+    fn get<Q>(&self, key: &Q) -> Option<EntryRef<K, V>>
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized;
 
     /// Inserts a key-value pair into the cache.
     ///
-    /// If the key already exists, the value may be updated according to the cache
-    /// implementation. This may trigger eviction if the cache is at capacity.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// cache.insert("key2".to_string(), 100);
-    /// ```
-    fn insert(&self, key: K, value: V) -> Option<Handler<K, V>>;
+    /// If the cache is at capacity, an existing entry will be evicted based
+    /// on the engine's policy. This is a convenience wrapper around
+    /// [`insert_with`] that always admits the new entry.
+    #[inline]
+    fn insert(&self, key: K, value: V, expired_at: Option<Instant>) {
+        self.insert_with(key, value, expired_at, |_, _| true);
+    }
 
-    fn insert_with<F>(&self, key: K, value: V, admission: F) -> Option<Handler<K, V>>
+    /// Inserts a key-value pair with a custom admission policy.
+    ///
+    /// The `admission` closure is called when the engine identifies a potential
+    /// eviction candidate. It compares the `(incoming_key, victim_key)`.
+    /// If it returns `false`, the insertion is rejected.
+    ///
+    /// # Guarantees
+    /// - If the key already exists in the cache, it is updated (admission is
+    ///   usually bypassed for updates).
+    /// - If an entry in a target slot is expired, it is evicted regardless
+    ///   of the admission policy.
+    fn insert_with<F>(&self, key: K, value: V, expired_at: Option<Instant>, admission: F)
     where
         F: Fn(&K, &K) -> bool;
 
-    /// Removes the cached entry for the given key.
+    /// Removes an entry from the cache.
     ///
-    /// Returns an `Option<Handler<K, V>>` containing the removed value if it was
-    /// present, or `None` otherwise.
+    /// Returns `true` if the entry was found and removed, `false` otherwise.
     ///
-    /// # Type Parameters
-    ///
-    /// - `Q`: A type that can be borrowed from `K` for lookup purposes.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// cache.remove("key1");
-    /// ```
-    fn remove<Q>(&self, key: &Q) -> Option<Handler<K, V>>
+    /// # Performance
+    /// This method is "fire-and-forget." It triggers the internal state machine
+    /// to transition the slot to a 'Vacant' state and schedules the memory
+    /// for reclamation without returning the underlying data.
+    fn remove<Q>(&self, key: &Q) -> bool
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized;
 
-    /// Returns the total capacity of the cache.
+    /// Returns the maximum number of entries the cache can hold.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// assert_eq!(cache.capacity(), 100);
-    /// ```
+    /// This represents the total number of slots allocated at initialization.
     fn capacity(&self) -> usize;
-
-    /// Returns the current number of entries in the cache.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// assert_eq!(cache.len(), 5);
-    /// ```
-    fn len(&self) -> usize;
-
-    /// Returns `true` if the cache has space to insert new entries without eviction.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// if cache.has_space() {
-    ///     cache.insert("key3".to_string(), 7);
-    /// }
-    /// ```
-    fn has_space(&self) -> bool;
-
-    /// Peeks at the next entry that would be evicted according to the cache policy,
-    /// without actually removing it.
-    ///
-    /// Returns `None` if the cache is empty.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// if let Some(evicted) = cache.peek_evicted() {
-    ///     println!("Next to evict: {:?}", evicted);
-    /// }
-    /// ```
-    fn peek_victim(&self) -> Option<Handler<K, V>>;
 }

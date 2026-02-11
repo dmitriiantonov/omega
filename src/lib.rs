@@ -1,7 +1,6 @@
-use crate::admission::{AdmissionPolicy, FrequentPolicy, NoAdmission};
-use crate::clock::ClockCache;
+pub use crate::admission::{AdmissionPolicy, AlwaysAdmission, FrequentPolicy};
 use crate::core::engine::CacheEngine;
-use crate::core::handler::Handler;
+use crate::core::handler::EntryRef;
 use crate::core::key::Key;
 use std::borrow::Borrow;
 use std::hash::Hash;
@@ -11,8 +10,7 @@ mod clock;
 mod cms;
 
 mod admission;
-mod config;
-mod core;
+pub mod core;
 
 pub struct Cache<E, K, V, P>
 where
@@ -25,13 +23,26 @@ where
     _phantom: PhantomData<(K, V)>,
 }
 
-impl<E, K, V, P> Cache<E, K, V, P>
+impl<E, K, V, A> Cache<E, K, V, A>
 where
     E: CacheEngine<K, V>,
     K: Eq + Hash,
-    P: AdmissionPolicy<K>,
+    A: AdmissionPolicy<K>,
 {
-    pub fn get<Q>(&self, key: &Q) -> Option<Handler<K, V>>
+    pub fn new(engine: E, admission_policy: A) -> Self {
+        Self {
+            engine,
+            admission_policy,
+            _phantom: Default::default(),
+        }
+    }
+
+    /// Retrieves a value from the cache.
+    ///
+    /// If the key exists, the admission policy is notified of the access.
+    ///
+    /// Returns a [`EntryRef`] that provides controlled access to the entry.
+    pub fn get<Q>(&self, key: &Q) -> Option<EntryRef<K, V>>
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash,
@@ -40,13 +51,24 @@ where
         self.engine.get(key)
     }
 
-    pub fn insert(&self, key: K, value: V) -> Option<Handler<K, V>> {
-        self.engine.insert_with(key, value, |incoming, victim| {
-            self.admission_policy.admit(incoming, victim)
-        })
+    /// Inserts a key-value pair into the cache.
+    ///
+    /// When the cache is full, an eviction candidate is selected by the engine.
+    /// The admission policy then decides whether the incoming entry should
+    /// replace the candidate.
+    ///
+    /// Returns a [`EntryRef`] if an existing entry was replaced.
+    pub fn insert(&self, key: K, value: V) {
+        self.engine
+            .insert_with(key, value, None, |incoming, victim| {
+                self.admission_policy.admit(incoming, victim)
+            })
     }
 
-    pub fn remove<Q>(&self, key: &Q) -> Option<Handler<K, V>>
+    /// Removes an entry from the cache.
+    ///
+    /// Returns a [`EntryRef`] if the entry was present.
+    pub fn remove<Q>(&self, key: &Q) -> bool
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash,
@@ -55,64 +77,28 @@ where
     }
 }
 
-struct RecentClockCache<K, V>
-where
-    K: Eq + Hash,
-{
-    cache: Cache<ClockCache<K, V>, K, V, NoAdmission<K>>,
-}
+#[cfg(test)]
+mod tests {
+    use crate::core::backoff::BackoffPolicy;
+    use macros::cache;
 
-impl<K, V> RecentClockCache<K, V>
-where
-    K: Eq + Hash,
-{
-    pub fn get<Q>(&self, key: &Q) -> Option<Handler<K, V>>
-    where
-        Key<K>: Borrow<Q>,
-        Q: Eq + Hash,
-    {
-        self.cache.get(key)
-    }
+    #[test]
+    fn test() {
+        let cache = cache!(
+            engine: Clock {
+                capacity: 100,
+                backoff: { policy: BackoffPolicy::Exponential, limit: 10 }
+            },
+            admission: Frequent {
+                count_min_sketch: { width: 1024, height: 4 },
+                decay_threshold: 1000
+            }
+        );
 
-    pub fn insert(&self, key: K, value: V) -> Option<Handler<K, V>> {
-        self.cache.insert(key, value)
-    }
+        cache.insert(1, 1);
 
-    pub fn remove<Q>(&self, key: &Q) -> Option<Handler<K, V>>
-    where
-        Key<K>: Borrow<Q>,
-        Q: Eq + Hash,
-    {
-        self.cache.remove(key)
-    }
-}
-
-struct FrequentClockCache<K, V>
-where
-    K: Eq + Hash,
-{
-    cache: Cache<ClockCache<K, V>, K, V, FrequentPolicy<K>>,
-}
-
-impl<K, V> FrequentClockCache<K, V> where K: Eq + Hash {
-
-    pub fn get<Q>(&self, key: &Q) -> Option<Handler<K, V>>
-    where
-        Key<K>: Borrow<Q>,
-        Q: Eq + Hash,
-    {
-        self.cache.get(key)
-    }
-
-    pub fn insert(&self, key: K, value: V) -> Option<Handler<K, V>> {
-        self.cache.insert(key, value)
-    }
-
-    pub fn remove<Q>(&self, key: &Q) -> Option<Handler<K, V>>
-    where
-        Key<K>: Borrow<Q>,
-        Q: Eq + Hash,
-    {
-        self.cache.remove(key)
+        if let Some(handler) = cache.get(&1) {
+            assert_eq!(&1, handler.value())
+        }
     }
 }

@@ -91,14 +91,23 @@ where
     }
 }
 
-pub struct NoAdmission<K>
+pub struct AlwaysAdmission<K>
 where
     K: Eq + Hash,
 {
     _phantom: PhantomData<K>,
 }
 
-impl<K> NoAdmission<K>
+impl<K> Default for AlwaysAdmission<K>
+where
+    K: Eq + Hash,
+ {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K> AlwaysAdmission<K>
 where
     K: Eq + Hash,
 {
@@ -109,7 +118,7 @@ where
     }
 }
 
-impl<K> AdmissionPolicy<K> for NoAdmission<K>
+impl<K> AdmissionPolicy<K> for AlwaysAdmission<K>
 where
     K: Eq + Hash,
 {

@@ -1,5 +1,6 @@
 use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};
+use std::ops::Deref;
 use std::sync::Arc;
 
 /// A key wrapper that uses `Arc` for cheap cloning and equality comparisons.
@@ -48,6 +49,14 @@ impl<K> AsRef<K> for Key<K> {
 
 impl<K> Borrow<K> for Key<K> {
     fn borrow(&self) -> &K {
+        self.0.as_ref()
+    }
+}
+
+impl<K> Deref for Key<K> {
+    type Target = K;
+
+    fn deref(&self) -> &Self::Target {
         self.0.as_ref()
     }
 }
