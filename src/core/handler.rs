@@ -13,7 +13,7 @@ use std::ptr::NonNull;
 /// Because it acts as a smart pointer to the [Entry] container rather than
 /// the value itself, it provides methods to access both the key and the value.
 #[derive(Debug)]
-pub struct EntryRef<K, V>
+pub struct Ref<K, V>
 where
     K: Eq + Hash,
 {
@@ -22,7 +22,7 @@ where
     _guard: Guard,
 }
 
-impl<K, V> EntryRef<K, V>
+impl<K, V> Ref<K, V>
 where
     K: Eq + Hash,
 {

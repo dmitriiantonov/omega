@@ -1,6 +1,6 @@
 pub use crate::admission::{AdmissionPolicy, AlwaysAdmission, FrequentPolicy};
 use crate::core::engine::CacheEngine;
-use crate::core::handler::EntryRef;
+use crate::core::handler::Ref;
 use crate::core::key::Key;
 use std::borrow::Borrow;
 use std::hash::Hash;
@@ -42,7 +42,7 @@ where
     /// If the key exists, the admission policy is notified of the access.
     ///
     /// Returns a [`EntryRef`] that provides controlled access to the entry.
-    pub fn get<Q>(&self, key: &Q) -> Option<EntryRef<K, V>>
+    pub fn get<Q>(&self, key: &Q) -> Option<Ref<K, V>>
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash,

@@ -122,7 +122,7 @@ impl<K> AdmissionPolicy<K> for AlwaysAdmission<K>
 where
     K: Eq + Hash,
 {
-    fn record<Q>(&self, key: &Q)
+    fn record<Q>(&self, _key: &Q)
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash,

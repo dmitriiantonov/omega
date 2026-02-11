@@ -2,7 +2,7 @@ use crate::clock::WriteResult::{Rejected, Retry, Written};
 use crate::core::backoff::BackoffConfig;
 use crate::core::engine::CacheEngine;
 use crate::core::entry::Entry;
-use crate::core::handler::EntryRef;
+use crate::core::handler::Ref;
 use crate::core::key::Key;
 use SlotState::{Claimed, Cold, Hot, Vacant};
 use crossbeam::epoch::{Atomic, Guard, Owned, pin};
@@ -97,7 +97,7 @@ where
     ///
     /// # Safety
     /// The returned handler holds a pinned guard ensuring safe access.
-    fn load<Q>(&self, key: &Q, guard: Guard) -> Option<EntryRef<K, V>>
+    fn load<Q>(&self, key: &Q, guard: Guard) -> Option<Ref<K, V>>
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
@@ -122,7 +122,7 @@ where
                     self.upgrade();
                 }
 
-                Some(EntryRef::new(NonNull::from(entry), guard))
+                Some(Ref::new(NonNull::from(entry), guard))
             }
         }
     }
@@ -294,7 +294,7 @@ where
     /// Get a value by key.
     ///
     /// Returns a `Handler` that pins the entry in memory.
-    fn get<Q>(&self, key: &Q) -> Option<EntryRef<K, V>>
+    fn get<Q>(&self, key: &Q) -> Option<Ref<K, V>>
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized,

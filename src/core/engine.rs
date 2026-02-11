@@ -2,7 +2,7 @@ use crate::core::key::Key;
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::time::Instant;
-use crate::core::handler::EntryRef;
+use crate::core::handler::Ref;
 
 /// A high-performance, concurrent cache engine.
 ///
@@ -28,7 +28,7 @@ where
     /// # Memory Safety
     /// The returned [`EntryRef`] pins the entry in memory using an epoch guard.
     /// The entry will not be deallocated until the reference is dropped.
-    fn get<Q>(&self, key: &Q) -> Option<EntryRef<K, V>>
+    fn get<Q>(&self, key: &Q) -> Option<Ref<K, V>>
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized;
