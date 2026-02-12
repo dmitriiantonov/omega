@@ -49,7 +49,10 @@ impl Parse for CacheInput {
         let admission =
             admission.ok_or_else(|| Error::new(input.span(), "field 'admission' is missing"))?;
 
-        Ok(CacheInput { engine, admission_policy: admission })
+        Ok(CacheInput {
+            engine,
+            admission_policy: admission,
+        })
     }
 }
 
@@ -229,12 +232,10 @@ impl Parse for EngineInput {
                     backoff,
                 })))
             }
-            _ => {
-                Err(Error::new(
-                    engine_type.span(),
-                    format!("engine type '${engine_type}' is not recognized"),
-                ))
-            }
+            _ => Err(Error::new(
+                engine_type.span(),
+                format!("engine type '${engine_type}' is not recognized"),
+            )),
         }
     }
 }
@@ -285,7 +286,8 @@ impl Parse for BackoffInput {
             }
         }
 
-        let policy = policy.ok_or_else(|| Error::new(content.span(), "field 'policy' is missing"))?;
+        let policy =
+            policy.ok_or_else(|| Error::new(content.span(), "field 'policy' is missing"))?;
         let limit = limit.ok_or_else(|| Error::new(content.span(), "field 'limit' is missing"))?;
 
         Ok(BackoffInput { policy, limit })

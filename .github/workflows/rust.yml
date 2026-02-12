@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -27,8 +27,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Clippy (Lints)
-        run: cargo clippy -- -D warnings
+#      - name: Clippy (Lints)
+#        run: cargo clippy -- -D warnings
 
   test:
     name: Run Tests

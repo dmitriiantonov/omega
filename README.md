@@ -1,15 +1,20 @@
-# README.md
+# Omega
 
-A high-performance, concurrent cache for Rust, featuring lock-free slot management, epoch-based memory reclamation, and TTL support.
+A high-performance, concurrent cache for Rust, featuring lock-free slot management, epoch-based memory reclamation, and
+TTL support.
 
 ## Overview
 
-Omega is a flexible, concurrent caching library designed for high-performance applications in Rust. It provides a generic cache interface with pluggable engines (e.g., Clock) and admission policies (e.g., Frequent), allowing customization for different use cases. The cache supports lock-free operations, efficient memory management using epochs, and time-to-live (TTL) for entries.
+Omega is a flexible, concurrent caching library designed for high-performance applications in Rust. It provides a
+generic cache interface with pluggable engines (e.g., Clock) and admission policies (e.g., Frequent), allowing
+customization for different use cases. The cache supports lock-free operations, efficient memory management using
+epochs, and time-to-live (TTL) for entries.
 
 ## Features
 
 - **Lock-free slot management**: Ensures high concurrency without blocking.
-- **Epoch-based memory reclamation**: Safe and efficient handling of memory in concurrent environments using `crossbeam-epoch`.
+- **Epoch-based memory reclamation**: Safe and efficient handling of memory in concurrent environments using
+  `crossbeam-epoch`.
 - **TTL support**: Automatic expiration of cache entries.
 - **Pluggable components**: Customizable cache engines and admission policies.
 - **High performance**: Optimized for low-latency access and insertion.
@@ -69,7 +74,8 @@ cache.remove(&1);
 
 ## Development
 
-The project is actively developed, with recent updates including rewritten tests and simplified clock cache logic (as of February 11, 2026).
+The project is actively developed, with recent updates including rewritten tests and simplified clock cache logic (as of
+February 11, 2026).
 
 ## Building and Testing
 

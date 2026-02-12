@@ -1,6 +1,6 @@
+use crate::core::key::Key;
 use std::hash::Hash;
 use std::time::Instant;
-use crate::core::key::Key;
 
 /// A container representing a single cached item.
 ///
@@ -20,7 +20,7 @@ where
     /// The value stored in the cache.
     value: V,
     /// An optional timestamp indicating when this entry becomes invalid.
-    expired_at: Option<Instant>
+    expired_at: Option<Instant>,
 }
 
 impl<K, V> Entry<K, V>
@@ -38,7 +38,7 @@ where
         Self {
             key: Key::new(key),
             value,
-            expired_at
+            expired_at,
         }
     }
 
@@ -70,6 +70,7 @@ where
     /// ```
     #[inline]
     pub fn is_expired(&self) -> bool {
-        self.expired_at.map_or(false, |deadline| Instant::now() > deadline)
+        self.expired_at
+            .is_some_and(|expired_at| Instant::now() > expired_at)
     }
 }

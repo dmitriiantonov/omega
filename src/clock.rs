@@ -173,9 +173,7 @@ where
         let shared_current_entry = self.entry.load(Acquire, &guard);
 
         if let Some(current_entry) = unsafe { shared_current_entry.as_ref() } {
-            if !(current_entry.is_expired()
-                || admission(entry.key(), current_entry.key()))
-            {
+            if !(current_entry.is_expired() || admission(entry.key(), current_entry.key())) {
                 self.store_state(state);
                 return Rejected;
             }
@@ -423,6 +421,7 @@ where
 mod tests {
     use super::*;
     use fake::Fake;
+
     use fake::faker::lorem::en::Word;
     use std::sync::{Arc, Barrier};
     use std::thread;

@@ -101,7 +101,7 @@ where
 impl<K> Default for AlwaysAdmission<K>
 where
     K: Eq + Hash,
- {
+{
     fn default() -> Self {
         Self::new()
     }

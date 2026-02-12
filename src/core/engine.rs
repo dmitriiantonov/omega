@@ -1,8 +1,8 @@
+use crate::core::handler::Ref;
 use crate::core::key::Key;
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::time::Instant;
-use crate::core::handler::Ref;
 
 /// A high-performance, concurrent cache engine.
 ///

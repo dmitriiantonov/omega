@@ -12,14 +12,14 @@ pub enum Backoff {
         /// The current maximum number of spins for the next jitter calculation.
         current: usize,
         /// The maximum allowed value for `current`.
-        limit: usize
+        limit: usize,
     },
     /// Exponential growth: doubles the maximum spin count each step until it hits the limit.
     Exponential {
         /// The current maximum number of spins for the next jitter calculation.
         current: usize,
         /// The maximum allowed value for `current`.
-        limit: usize
+        limit: usize,
     },
 }
 

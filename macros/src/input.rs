@@ -6,17 +6,17 @@ pub struct CacheInput {
 }
 
 pub enum EngineInput {
-    Clock(Box<ClockInput>)
+    Clock(Box<ClockInput>),
 }
 
 pub struct ClockInput {
     pub capacity: Expr,
-    pub backoff: BackoffInput
+    pub backoff: BackoffInput,
 }
 
 pub struct BackoffInput {
     pub policy: Expr,
-    pub limit: Expr
+    pub limit: Expr,
 }
 
 pub enum AdmissionInput {
