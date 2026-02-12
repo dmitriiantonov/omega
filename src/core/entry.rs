@@ -62,7 +62,8 @@ where
     /// # Examples
     ///
     /// ```
-    /// use std::time::{Instant, Duration};
+    /// use std::time::{Duration, Instant};
+    /// use omega::core::entry::Entry;
     /// // Entry that expired 1 second ago
     /// let past = Instant::now() - Duration::from_secs(1);
     /// let entry = Entry::new("key", "value", Some(past));

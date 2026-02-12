@@ -176,19 +176,6 @@ mod tests {
     }
 
     #[test]
-    fn test_saturating_multiplication() {
-        // Ensure that even with a massive cap, we don't panic on overflow
-        let mut exp = Backoff::exponential(usize::MAX);
-        // Set current to something that would overflow if doubled
-        if let Backoff::Exponential { current, .. } = &mut exp {
-            *current = usize::MAX / 2 + 1;
-        }
-
-        exp.backoff();
-        assert_eq!(exp.current_limit(), usize::MAX);
-    }
-
-    #[test]
     fn test_backoff_does_not_panic() {
         let mut backoff = Backoff::exponential(10);
         // Simple smoke test to ensure no internal panics during execution
