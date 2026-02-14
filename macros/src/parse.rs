@@ -5,7 +5,7 @@ use crate::ast::{
 use proc_macro2::Ident;
 use syn::parse::{Parse, ParseStream};
 use syn::token::{Brace, Token};
-use syn::{braced, parse_quote, Error, Expr, Token};
+use syn::{Error, Expr, Token, braced, parse_quote};
 
 const DEFAULT_SHARDS: usize = 4;
 const DEFAULT_LATENCY_SAMPLES: usize = 1024;
@@ -49,7 +49,8 @@ impl Parse for CacheInput {
         }
 
         let engine = engine.ok_or_else(|| Error::new(input.span(), "field 'engine' is missing"))?;
-        let admission = admission.ok_or_else(|| Error::new(input.span(), "field 'admission' is missing"))?;
+        let admission =
+            admission.ok_or_else(|| Error::new(input.span(), "field 'admission' is missing"))?;
 
         Ok(CacheInput {
             engine,
@@ -233,14 +234,14 @@ impl Parse for EngineInput {
                     }
                 }
 
-                let capacity = capacity.ok_or_else(|| Error::new(content.span(), "field 'capacity' is missing"))?;
-                let backoff = backoff.ok_or_else(|| Error::new(content.span(), "field 'backoff' is missing"))?;
+                let capacity = capacity
+                    .ok_or_else(|| Error::new(content.span(), "field 'capacity' is missing"))?;
+                let backoff = backoff
+                    .ok_or_else(|| Error::new(content.span(), "field 'backoff' is missing"))?;
 
-                let metrics = metrics.unwrap_or_else(|| {
-                    MetricsInput {
-                        shards: parse_quote!(#DEFAULT_SHARDS),
-                        latency_samples: parse_quote!(#DEFAULT_LATENCY_SAMPLES)
-                    }
+                let metrics = metrics.unwrap_or_else(|| MetricsInput {
+                    shards: parse_quote!(#DEFAULT_SHARDS),
+                    latency_samples: parse_quote!(#DEFAULT_LATENCY_SAMPLES),
                 });
 
                 Ok(EngineInput::Clock(Box::new(ClockInput {
@@ -303,7 +304,8 @@ impl Parse for BackoffInput {
             }
         }
 
-        let policy = policy.ok_or_else(|| Error::new(content.span(), "field 'policy' is missing"))?;
+        let policy =
+            policy.ok_or_else(|| Error::new(content.span(), "field 'policy' is missing"))?;
         let limit = limit.ok_or_else(|| Error::new(content.span(), "field 'limit' is missing"))?;
 
         Ok(BackoffInput { policy, limit })
@@ -358,7 +360,8 @@ impl Parse for MetricsInput {
 
         Ok(MetricsInput {
             shards: shards.unwrap_or_else(|| parse_quote!(#DEFAULT_SHARDS)),
-            latency_samples: latency_samples.unwrap_or_else(|| parse_quote!(#DEFAULT_LATENCY_SAMPLES)),
+            latency_samples: latency_samples
+                .unwrap_or_else(|| parse_quote!(#DEFAULT_LATENCY_SAMPLES)),
         })
     }
 }

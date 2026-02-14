@@ -5,7 +5,8 @@ use crate::core::entry::Entry;
 use crate::core::handler::Ref;
 use crate::core::key::Key;
 use crate::metrics::{Metrics, MetricsConfig, MetricsSnapshot};
-use crossbeam::epoch::{pin, Atomic, Guard, Owned};
+use SlotState::{Claimed, Cold, Hot, Vacant};
+use crossbeam::epoch::{Atomic, Guard, Owned, pin};
 use dashmap::DashMap;
 use std::borrow::Borrow;
 use std::hash::Hash;
@@ -13,7 +14,6 @@ use std::ptr::NonNull;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicU8, AtomicUsize};
 use std::time::Instant;
-use SlotState::{Claimed, Cold, Hot, Vacant};
 
 /// Represents the state of a slot in the Clock cache.
 ///

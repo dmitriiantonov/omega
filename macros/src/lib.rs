@@ -1,6 +1,6 @@
 use crate::ast::{AdmissionInput, BackoffInput, CacheInput, EngineInput, MetricsInput};
 use proc_macro::TokenStream;
-use quote::{quote, ToTokens};
+use quote::{ToTokens, quote};
 use syn::parse_macro_input;
 
 mod ast;

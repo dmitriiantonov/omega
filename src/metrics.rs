@@ -569,8 +569,8 @@ impl Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
     use std::sync::Barrier;
+    use std::thread;
 
     /// Verifies that configuration values for shards and samples are automatically
     /// rounded up to the nearest power of two to support bitmask indexing.
@@ -682,8 +682,12 @@ mod tests {
     fn test_hit_and_miss_rates() {
         let metrics = Metrics::new(MetricsConfig::new(4, 1024));
 
-        for _ in 0..80 { metrics.record_hit(); }
-        for _ in 0..20 { metrics.record_miss(); }
+        for _ in 0..80 {
+            metrics.record_hit();
+        }
+        for _ in 0..20 {
+            metrics.record_miss();
+        }
 
         let snap = metrics.snapshot();
 
@@ -698,7 +702,9 @@ mod tests {
     fn test_eviction_tracking() {
         let metrics = Metrics::default();
 
-        for _ in 0..15 { metrics.record_eviction(); }
+        for _ in 0..15 {
+            metrics.record_eviction();
+        }
 
         let snap = metrics.snapshot();
         assert_eq!(snap.eviction_count(), 15);

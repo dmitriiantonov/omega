@@ -1,9 +1,9 @@
 use crate::core::handler::Ref;
 use crate::core::key::Key;
+use crate::metrics::MetricsSnapshot;
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::time::Instant;
-use crate::metrics::MetricsSnapshot;
 
 /// A high-performance, concurrent cache engine.
 ///

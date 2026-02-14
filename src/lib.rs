@@ -2,10 +2,10 @@ pub use crate::admission::{AdmissionPolicy, AlwaysAdmission, FrequentPolicy};
 use crate::core::engine::CacheEngine;
 use crate::core::handler::Ref;
 use crate::core::key::Key;
+use crate::metrics::MetricsSnapshot;
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::marker::PhantomData;
-use crate::metrics::MetricsSnapshot;
 
 mod clock;
 mod cms;
@@ -85,9 +85,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::thread::scope;
     use crate::core::backoff::BackoffPolicy;
     use macros::cache;
+    use std::thread::scope;
 
     #[test]
     fn test_cache_get_and_insert() {
@@ -121,9 +121,9 @@ mod tests {
         cache.insert(2, 2);
         cache.insert(3, 3);
 
-        let presence = (cache.get(&1).is_some() as u8) +
-            (cache.get(&2).is_some() as u8) +
-            (cache.get(&3).is_some() as u8);
+        let presence = (cache.get(&1).is_some() as u8)
+            + (cache.get(&2).is_some() as u8)
+            + (cache.get(&3).is_some() as u8);
 
         assert_eq!(presence, 2, "Cache should only contain 2 items");
     }
@@ -145,13 +145,13 @@ mod tests {
         cache.insert(1, 1);
 
         scope(|s| {
-            s.spawn(||{
+            s.spawn(|| {
                 for _ in 0..80 {
                     let _ = cache.get(&1);
                 }
             });
 
-            s.spawn(||{
+            s.spawn(|| {
                 for _ in 0..20 {
                     let _ = cache.get(&2);
                 }

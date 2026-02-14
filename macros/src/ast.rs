@@ -12,7 +12,7 @@ pub enum EngineInput {
 pub struct ClockInput {
     pub capacity: Expr,
     pub backoff: BackoffInput,
-    pub metrics: MetricsInput
+    pub metrics: MetricsInput,
 }
 
 pub struct BackoffInput {
@@ -37,5 +37,5 @@ pub struct CountMinSketchInput {
 
 pub struct MetricsInput {
     pub shards: Expr,
-    pub latency_samples: Expr
+    pub latency_samples: Expr,
 }
