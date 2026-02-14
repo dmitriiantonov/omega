@@ -12,6 +12,7 @@ twox-hash = "2.1.2"
 fastrand = "2.3.0"
 macros = { path = "macros" }
 crossbeam-epoch = "0.9.18"
+hdrhistogram = "7.5.4"
 
 [dev-dependencies]
 fake = "4.4.0"

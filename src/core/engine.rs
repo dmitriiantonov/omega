@@ -3,6 +3,7 @@ use crate::core::key::Key;
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::time::Instant;
+use crate::metrics::MetricsSnapshot;
 
 /// A high-performance, concurrent cache engine.
 ///
@@ -75,4 +76,6 @@ where
     ///
     /// This represents the total number of slots allocated at initialization.
     fn capacity(&self) -> usize;
+
+    fn metrics(&self) -> MetricsSnapshot;
 }

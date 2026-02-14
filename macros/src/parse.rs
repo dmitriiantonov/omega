@@ -1,11 +1,14 @@
-use crate::input::{
+use crate::ast::{
     AdmissionInput, BackoffInput, CacheInput, ClockInput, CountMinSketchInput, EngineInput,
-    FrequentAdmissionInput,
+    FrequentAdmissionInput, MetricsInput,
 };
 use proc_macro2::Ident;
 use syn::parse::{Parse, ParseStream};
-use syn::token::Brace;
-use syn::{Error, Expr, Token, braced};
+use syn::token::{Brace, Token};
+use syn::{braced, parse_quote, Error, Expr, Token};
+
+const DEFAULT_SHARDS: usize = 4;
+const DEFAULT_LATENCY_SAMPLES: usize = 1024;
 
 impl Parse for CacheInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
@@ -46,8 +49,7 @@ impl Parse for CacheInput {
         }
 
         let engine = engine.ok_or_else(|| Error::new(input.span(), "field 'engine' is missing"))?;
-        let admission =
-            admission.ok_or_else(|| Error::new(input.span(), "field 'admission' is missing"))?;
+        let admission = admission.ok_or_else(|| Error::new(input.span(), "field 'admission' is missing"))?;
 
         Ok(CacheInput {
             engine,
@@ -187,6 +189,7 @@ impl Parse for EngineInput {
 
                 let mut capacity = None;
                 let mut backoff = None;
+                let mut metrics = None;
 
                 while !content.is_empty() {
                     let key = content.parse::<Ident>()?;
@@ -209,6 +212,14 @@ impl Parse for EngineInput {
                             let value = content.parse::<BackoffInput>()?;
                             backoff = Some(value);
                         }
+                        "metrics" => {
+                            if metrics.is_some() {
+                                return Err(Error::new(key.span(), "field metrics is duplicate"));
+                            }
+
+                            let value = content.parse::<MetricsInput>()?;
+                            metrics = Some(value)
+                        }
                         _ => {
                             return Err(Error::new(
                                 key.span(),
@@ -222,14 +233,20 @@ impl Parse for EngineInput {
                     }
                 }
 
-                let capacity = capacity
-                    .ok_or_else(|| Error::new(content.span(), "field 'capacity' is missing"))?;
-                let backoff = backoff
-                    .ok_or_else(|| Error::new(content.span(), "field 'backoff' is missing"))?;
+                let capacity = capacity.ok_or_else(|| Error::new(content.span(), "field 'capacity' is missing"))?;
+                let backoff = backoff.ok_or_else(|| Error::new(content.span(), "field 'backoff' is missing"))?;
+
+                let metrics = metrics.unwrap_or_else(|| {
+                    MetricsInput {
+                        shards: parse_quote!(#DEFAULT_SHARDS),
+                        latency_samples: parse_quote!(#DEFAULT_LATENCY_SAMPLES)
+                    }
+                });
 
                 Ok(EngineInput::Clock(Box::new(ClockInput {
                     capacity,
                     backoff,
+                    metrics,
                 })))
             }
             _ => Err(Error::new(
@@ -286,10 +303,62 @@ impl Parse for BackoffInput {
             }
         }
 
-        let policy =
-            policy.ok_or_else(|| Error::new(content.span(), "field 'policy' is missing"))?;
+        let policy = policy.ok_or_else(|| Error::new(content.span(), "field 'policy' is missing"))?;
         let limit = limit.ok_or_else(|| Error::new(content.span(), "field 'limit' is missing"))?;
 
         Ok(BackoffInput { policy, limit })
+    }
+}
+
+impl Parse for MetricsInput {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        if !input.peek(Brace) {
+            return Err(Error::new(input.span(), "missing the brace block"));
+        }
+
+        let content;
+        braced!(content in input);
+
+        let mut shards = None;
+        let mut latency_samples = None;
+
+        while !content.is_empty() {
+            let key = content.parse::<Ident>()?;
+            let _ = content.parse::<Token![:]>()?;
+
+            match key.to_string().as_str() {
+                "shards" => {
+                    if shards.is_some() {
+                        return Err(Error::new(key.span(), ""));
+                    }
+
+                    let value = content.parse::<Expr>()?;
+                    shards = Some(value);
+                }
+                "latency_samples" => {
+                    if latency_samples.is_some() {
+                        return Err(Error::new(key.span(), ""));
+                    }
+
+                    let value = content.parse::<Expr>()?;
+                    latency_samples = Some(value);
+                }
+                _ => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!("field '${key}' doesn't relate to metrics"),
+                    ));
+                }
+            }
+
+            if content.peek(Token![,]) {
+                let _ = content.parse::<Token![,]>()?;
+            }
+        }
+
+        Ok(MetricsInput {
+            shards: shards.unwrap_or_else(|| parse_quote!(#DEFAULT_SHARDS)),
+            latency_samples: latency_samples.unwrap_or_else(|| parse_quote!(#DEFAULT_LATENCY_SAMPLES)),
+        })
     }
 }

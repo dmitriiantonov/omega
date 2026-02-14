@@ -4,8 +4,8 @@ use crate::core::engine::CacheEngine;
 use crate::core::entry::Entry;
 use crate::core::handler::Ref;
 use crate::core::key::Key;
-use SlotState::{Claimed, Cold, Hot, Vacant};
-use crossbeam::epoch::{Atomic, Guard, Owned, pin};
+use crate::metrics::{Metrics, MetricsConfig, MetricsSnapshot};
+use crossbeam::epoch::{pin, Atomic, Guard, Owned};
 use dashmap::DashMap;
 use std::borrow::Borrow;
 use std::hash::Hash;
@@ -13,6 +13,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicU8, AtomicUsize};
 use std::time::Instant;
+use SlotState::{Claimed, Cold, Hot, Vacant};
 
 /// Represents the state of a slot in the Clock cache.
 ///
@@ -256,6 +257,7 @@ where
     /// Maximum number of elements.
     capacity: usize,
     backoff_config: BackoffConfig,
+    metrics: Metrics,
 }
 
 impl<K, V> ClockCache<K, V>
@@ -266,7 +268,11 @@ where
     ///
     /// # Panics
     /// Capacity must be a power-of-two.
-    pub fn new(capacity: usize, backoff_config: BackoffConfig) -> Self {
+    pub fn new(
+        capacity: usize,
+        backoff_config: BackoffConfig,
+        metrics_config: MetricsConfig,
+    ) -> Self {
         let slots = (0..capacity)
             .map(|_| Slot::empty())
             .collect::<Vec<_>>()
@@ -281,6 +287,7 @@ where
             capacity_mask,
             capacity,
             backoff_config,
+            metrics: Metrics::new(metrics_config),
         }
     }
 }
@@ -297,17 +304,42 @@ where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
+        let called_at = Instant::now();
         let guard = pin();
-        self.index.get(key).and_then(|entry| {
-            let index = *entry.value();
-            self.slots[index].load(key, guard)
-        })
+
+        self.index
+            .get(key)
+            .and_then(|entry| {
+                let index = *entry.value();
+
+                match self.slots[index].load(key, guard) {
+                    None => {
+                        self.metrics.record_miss();
+                        let elapsed = called_at.elapsed().as_millis() as u64;
+                        self.metrics.record_latency(elapsed);
+                        None
+                    }
+                    Some(reference) => {
+                        self.metrics.record_hit();
+                        let elapsed = called_at.elapsed().as_millis() as u64;
+                        self.metrics.record_latency(elapsed);
+                        Some(reference)
+                    }
+                }
+            })
+            .or_else(|| {
+                self.metrics.record_miss();
+                let elapsed = called_at.elapsed().as_millis() as u64;
+                self.metrics.record_latency(elapsed);
+                None
+            })
     }
 
     fn insert_with<F>(&self, key: K, value: V, expired_at: Option<Instant>, admission: F)
     where
         F: Fn(&K, &K) -> bool,
     {
+        let called_at = Instant::now();
         let mut entry = Entry::new(key, value, expired_at);
         let mut iter = SlotIter::new(self);
         let mut backoff = self.backoff_config.build();
@@ -330,12 +362,17 @@ where
                 &admission,
                 |key| {
                     self.index.remove(key);
+                    self.metrics.record_eviction();
                 },
                 |key| {
                     self.index.insert(key.clone(), index);
                 },
             ) {
-                Written | Rejected => break,
+                Written | Rejected => {
+                    let elapsed = called_at.elapsed().as_millis() as u64;
+                    self.metrics.record_latency(elapsed);
+                    break;
+                }
                 Retry(passed_entry) => {
                     backoff.backoff();
                     entry = passed_entry
@@ -352,8 +389,14 @@ where
         self.index.remove(key).is_some()
     }
 
+    #[inline]
     fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    #[inline]
+    fn metrics(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
     }
 }
 
@@ -442,7 +485,11 @@ mod tests {
     /// Verifies that EntryRef (Epoch Guard) protects memory even after eviction.
     #[test]
     fn test_ghost_reference_safety() {
-        let cache = Arc::new(ClockCache::new(2, backoff_config()));
+        let cache = Arc::new(ClockCache::new(
+            2,
+            backoff_config(),
+            MetricsConfig::default(),
+        ));
         let (key, value) = (generate_data(), generate_data());
 
         cache.insert(key.clone(), value.clone(), None);
@@ -463,7 +510,7 @@ mod tests {
     /// Verifies that accessed (Hot) items survive eviction longer than Cold items.
     #[test]
     fn test_clock_eviction_priority() {
-        let cache = ClockCache::new(2, backoff_config());
+        let cache = ClockCache::new(2, backoff_config(), MetricsConfig::default());
 
         cache.insert(1, generate_data(), None);
         cache.insert(2, generate_data(), None);
@@ -486,7 +533,7 @@ mod tests {
     /// Verifies that the cache respects the closure's decision to skip an insertion.
     #[test]
     fn test_admission_policy_rejection() {
-        let cache = ClockCache::new(10, backoff_config());
+        let cache = ClockCache::new(10, backoff_config(), MetricsConfig::default());
 
         cache.insert(1, "important".to_string(), None);
 
@@ -508,7 +555,7 @@ mod tests {
     /// Verifies that the public API hides expired items.
     #[test]
     fn test_ttl_expiration() {
-        let cache = ClockCache::new(10, backoff_config());
+        let cache = ClockCache::new(10, backoff_config(), MetricsConfig::default());
         let short_lived = Duration::from_millis(50);
         let (key, value) = ("key".to_string(), "value".to_string());
 
@@ -529,7 +576,11 @@ mod tests {
 
     #[test]
     fn test_concurrent_hammer() {
-        let cache = Arc::new(ClockCache::new(64, backoff_config()));
+        let cache = Arc::new(ClockCache::new(
+            64,
+            backoff_config(),
+            MetricsConfig::default(),
+        ));
         let threads = 8;
         let ops = 1000;
         let barrier = Arc::new(Barrier::new(threads));

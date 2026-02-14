@@ -1,9 +1,9 @@
-use crate::input::{AdmissionInput, BackoffInput, CacheInput, EngineInput};
+use crate::ast::{AdmissionInput, BackoffInput, CacheInput, EngineInput, MetricsInput};
 use proc_macro::TokenStream;
-use quote::{ToTokens, quote};
+use quote::{quote, ToTokens};
 use syn::parse_macro_input;
 
-mod input;
+mod ast;
 mod parse;
 
 #[proc_macro]
@@ -29,7 +29,7 @@ impl ToTokens for CacheInput {
 impl ToTokens for AdmissionInput {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
         match self {
-            AdmissionInput::Always => tokens.extend(quote! { ::omega::AlwaysAdmission::new() }),
+            AdmissionInput::Always => tokens.extend(quote! { crate::AlwaysAdmission::new() }),
             AdmissionInput::Frequent(frequent) => {
                 let frequent = frequent.as_ref();
                 let cms_width = &frequent.count_min_sketch.width;
@@ -52,9 +52,10 @@ impl ToTokens for EngineInput {
             EngineInput::Clock(clock) => {
                 let capacity = &clock.capacity;
                 let backoff = &clock.backoff;
+                let metrics = &clock.metrics;
 
                 tokens.extend(quote! {
-                    crate::clock::ClockCache::new(#capacity, #backoff)
+                    crate::clock::ClockCache::new(#capacity, #backoff, #metrics)
                 });
             }
         }
@@ -71,5 +72,16 @@ impl ToTokens for BackoffInput {
         };
 
         tokens.extend(extend);
+    }
+}
+
+impl ToTokens for MetricsInput {
+    fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
+        let shards = &self.shards;
+        let latency_samples = &self.latency_samples;
+
+        tokens.extend(quote! {
+            crate::metrics::MetricsConfig::new(#shards, #latency_samples)
+        });
     }
 }

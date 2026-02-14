@@ -5,12 +5,14 @@ use crate::core::key::Key;
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::marker::PhantomData;
+use crate::metrics::MetricsSnapshot;
 
 mod clock;
 mod cms;
 
 mod admission;
 pub mod core;
+pub mod metrics;
 
 pub struct Cache<E, K, V, P>
 where
@@ -75,19 +77,64 @@ where
     {
         self.engine.remove(key)
     }
+
+    pub fn metrics(&self) -> MetricsSnapshot {
+        self.engine.metrics()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::thread::scope;
     use crate::core::backoff::BackoffPolicy;
     use macros::cache;
 
     #[test]
-    fn test() {
+    fn test_cache_get_and_insert() {
+        let cache = cache!(
+            engine: Clock {
+                capacity: 10,
+                backoff: { policy: BackoffPolicy::Exponential, limit: 10 },
+            },
+            admission: Always
+        );
+
+        cache.insert("key1", "value1");
+        cache.insert("key2", "value2");
+
+        assert_eq!(cache.get(&"key1").map(|r| *r.value()), Some("value1"));
+        assert_eq!(cache.get(&"key2").map(|r| *r.value()), Some("value2"));
+        assert!(cache.get(&"key3").is_none());
+    }
+
+    #[test]
+    fn test_eviction_on_full_capacity() {
+        let cache = cache!(
+            engine: Clock {
+                capacity: 2,
+                backoff: { policy: BackoffPolicy::Exponential, limit: 10 }
+            },
+            admission: Always
+        );
+
+        cache.insert(1, 1);
+        cache.insert(2, 2);
+        cache.insert(3, 3);
+
+        let presence = (cache.get(&1).is_some() as u8) +
+            (cache.get(&2).is_some() as u8) +
+            (cache.get(&3).is_some() as u8);
+
+        assert_eq!(presence, 2, "Cache should only contain 2 items");
+    }
+
+    #[test]
+    fn test_metrics_tracking() {
         let cache = cache!(
             engine: Clock {
                 capacity: 100,
-                backoff: { policy: BackoffPolicy::Exponential, limit: 10 }
+                backoff: { policy: BackoffPolicy::Exponential, limit: 10 },
+                metrics: { shards: 8, latency_samples: 1024 },
             },
             admission: Frequent {
                 count_min_sketch: { width: 1024, height: 4 },
@@ -97,8 +144,25 @@ mod tests {
 
         cache.insert(1, 1);
 
-        if let Some(handler) = cache.get(&1) {
-            assert_eq!(&1, handler.value())
-        }
+        scope(|s| {
+            s.spawn(||{
+                for _ in 0..80 {
+                    let _ = cache.get(&1);
+                }
+            });
+
+            s.spawn(||{
+                for _ in 0..20 {
+                    let _ = cache.get(&2);
+                }
+            });
+        });
+
+        let metrics = cache.metrics();
+
+        assert_eq!(80, metrics.hit_count());
+        assert_eq!(20, metrics.miss_count());
+        assert_eq!(0.8, metrics.hit_rate());
+        assert_eq!(0.2, metrics.miss_rate());
     }
 }
