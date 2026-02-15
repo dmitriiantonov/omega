@@ -1,25 +1,28 @@
-//! # High-Performance Sharded Metrics
-//!
-//! This module provides a lock-free, sharded metrics collection system optimized for
-//! throughput-intensive applications where cache contention is the primary bottleneck.
-//!
-//! ## Design Principles
-//! 1. **Contention Mitigation:** Uses `THREAD_ID` based sharding to ensure that
-//!    concurrent increments likely hit different cache lines.
-//! 2. **False Sharing Prevention:** Explicitly pads internal structures to 64-byte
-//!    boundaries to prevent CPU cache line invalidation.
-//! 3. **Non-Blocking Writes:** Uses `Relaxed` atomic ordering to ensure metrics
-//!    collection adds negligible overhead to the hot path.
 use crossbeam::utils::CachePadded;
 use hdrhistogram::Histogram;
-use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize};
 
 /// Default number of shards if not specified.
 pub const DEFAULT_SHARDS: usize = 4;
 
 /// Default capacity for the circular latency buffer.
 pub const DEFAULT_LATENCY_SAMPLES: usize = 256;
+
+/// A bitmask used to isolate the data portion of a packed 64-bit sample.
+///
+/// This mask covers the lower 48 bits (bits 0–47), providing a valid range
+/// for values from 0 up to 281,474,976,710,655. Any bits above index 47
+/// are zeroed out by this mask.
+pub const SAMPLE_DATA_MASK: u64 = (1 << 48) - 1;
+
+/// The number of bits to shift a 16-bit sequence ID to place it in the
+/// most significant bits of a 64-bit word.
+///
+/// This shift positions the `sequence_id` (generation tag) in bits 48–63,
+/// effectively separating the metadata from the sample value for atomic
+/// updates and ghost data filtering.
+pub const SAMPLE_SEQUENCE_ID_SHIFT: usize = 48;
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -202,8 +205,7 @@ impl Metrics {
         let mut hit_count: u64 = 0;
         let mut miss_count: u64 = 0;
         let mut eviction_count: u64 = 0;
-        let mut latency_histogram: Histogram<u64> =
-            Histogram::new_with_bounds(1, 3600, 2).expect("arguments are invalid");
+        let mut latency_histogram = create_latency_histogram();
 
         for metrics_storage in &self.shards {
             hit_count = hit_count.saturating_add(metrics_storage.hit_count());
@@ -479,6 +481,7 @@ pub struct Sampler {
     /// The monotonic write cursor. Padded to prevent the "Hot Head"
     /// contention from affecting adjacent memory.
     head: CachePadded<AtomicUsize>,
+    sequence_id: CachePadded<AtomicU16>,
     /// Bitmask for fast index calculation ($capacity - 1$).
     mask: usize,
 }
@@ -498,35 +501,43 @@ impl Sampler {
         Self {
             samples: values,
             head: CachePadded::new(AtomicUsize::new(0)),
+            sequence_id: CachePadded::new(AtomicU16::new(1)),
             mask: len - 1,
         }
     }
 
     /// Records a value into the circular buffer using a bit-packed generation tag.
     ///
-    /// This operation is **wait-free**. It uniquely identifies each sample with
-    /// a "lap" (generation) count to prevent stale data from being read in
-    /// subsequent snapshots.
+    /// This operation is **wait-free**, ensuring that high-frequency writers are never
+    /// blocked by concurrent readers or other writers. It uniquely tags each sample
+    /// with a `sequence_id` (lap count) to prevent "ghost reads"—where stale data
+    /// from a previous rotation of the buffer is incorrectly included in a new snapshot.
     ///
-    /// # Bit Packing Layout
-    /// To store both the generation and the value in a single atomic operation:
-    /// - **Bits 63-48 (16 bits):** Generation/Lap count.
-    /// - **Bits 47-0 (48 bits):** Latency value (supports values up to $\approx 281$ trillion).
+    /// # Bit-Packing Layout
+    /// The 64-bit atomic slot is partitioned to allow single-word updates:
+    /// * **Bits 63–48 (16 bits):** `sequence_id`. Acts as a filter to validate data "freshness."
+    /// * **Bits 47–0 (48 bits):** `data`. Supports measurements up to $2^{48} - 1$ (e.g., $\approx 281$ TB or 281 trillion nanoseconds).
     ///
     ///
     ///
-    /// # Performance
-    /// The use of a bitmask ($head \ \& \ mask$) avoids the overhead of integer
-    /// division, making this suitable for high-frequency event loops.
+    /// # Performance & Safety
+    /// * **Efficiency:** Uses a bitwise mask (`head & mask`) for indexing, avoiding
+    ///   expensive integer division. This requires the buffer size to be a power of two.
+    /// * **Memory Ordering:** Uses `Relaxed` for the index increment to minimize
+    ///   cache-line contention, while `Acquire` on the `sequence_id` ensures the writer
+    ///   is synchronized with the current global lap.
+    ///
+    /// # Examples
+    /// Since the value is masked by `SAMPLER_VALUE_MASK`, any bits higher than 47
+    /// provided in the `value` argument will be truncated to ensure the `sequence_id`
+    /// remains uncorrupted.
     #[inline]
-    pub fn record(&self, value: u64) {
+    pub fn record(&self, data: u64) {
         let head = self.head.fetch_add(1, Relaxed);
-        let index = head & self.mask;
-        // Optimization: since len is a power of two, we could use bitshifts
-        // if capacity is known, but division here is on the hot path only once.
-        let lap = (head / self.samples.len()) as u64;
+        let sequence_id = self.sequence_id.load(Acquire);
 
-        let packed = (lap << 48) | (value & 0x0000FFFFFFFFFFFF);
+        let index = head & self.mask;
+        let packed = sample_pack(sequence_id, data);
         self.samples[index].store(packed, Relaxed);
     }
 
@@ -536,40 +547,91 @@ impl Sampler {
         self.samples.len()
     }
 
-    /// Aggregates samples that belong only to the current buffer generation.
+    /// Aggregates samples from the buffer that match the generation active at the start of the call.
     ///
     /// # Ghost Data Prevention
-    /// This method compares the generation tag of each stored sample against
-    /// the current `head`'s generation. If a sample's tag is older than the
-    /// current lap, it is ignored as "ghost" data from a previous cycle.
+    /// This method implements a **generation-flip snapshot**. By atomically incrementing
+    /// the `sequence_id` at the entry point, it captures the ID of the just-completed
+    /// generation. During iteration, it filters the buffer to prevent:
+    /// * **Stale Data (Ghosts):** Samples with a tag smaller than `sequency_id` are ignored.
+    /// * **Future Data:** Samples with a tag larger than `sequency_id` (from writers that
+    ///   started after this read began) trigger an early `break`.
     ///
-    /// # Concurrency
-    /// This is a non-blocking read. While the loop is eventually consistent,
-    /// the generation check ensures that the resulting histogram contains
-    /// only data from the most recent $N$ operations.
+    /// # Concurrency & Performance
+    /// * **Wait-Free:** Writers are never blocked. They simply begin tagging new
+    ///   samples with the next generation ID while this reader processes the previous one.
+    /// * **Early Exit:** The `break` condition optimizes for cases where writers
+    ///   rapidly overtake the reader, preventing unnecessary iteration over "future" slots.
+    /// * **Memory Ordering:** Uses `Release` on the increment to ensure subsequent
+    ///   writes in the next generation are ordered after this snapshot's boundary.
     ///
-    ///
+    /// # Panics
+    /// Does not panic, though it assumes the buffer is not so large that the reader
+    /// cannot complete a pass before the 16-bit `sequence_id` wraps around.
     #[inline]
     pub fn write_samples(&self, histogram: &mut Histogram<u64>) {
-        let current_head = self.head.load(Relaxed);
-        let current_lap = (current_head / self.samples.len()) as u64;
+        let global_sequence_id = self.sequence_id.fetch_add(1, Release);
 
-        for sample_atomic in &self.samples {
-            let packed = sample_atomic.load(Relaxed);
-            let lap = packed >> 48;
-            let val = packed & 0x0000FFFFFFFFFFFF;
+        for sample in &self.samples {
+            let (sample_sequence_id, data) = sample_unpack(sample.load(Relaxed));
 
-            if val > 0 && lap == current_lap {
-                let _ = histogram.record(val);
+            if sample_sequence_id > global_sequence_id {
+                break;
+            }
+
+            if data > 0 && sample_sequence_id == global_sequence_id {
+                let _ = histogram.record(data);
             }
         }
     }
 }
 
+/// Packs a 16-bit sequence ID and a 48-bit data value into a single 64-bit word.
+///
+/// # Invariants
+/// If the provided `data` exceeds the 48-bit range ($> 2^{48}-1$), the high bits
+/// are truncated via `SAMPLE_DATA_MASK` to prevent corruption of the `sequence_id`.
+fn sample_pack(sequence_id: u16, data: u64) -> u64 {
+    (data & SAMPLE_DATA_MASK) | ((sequence_id as u64) << SAMPLE_SEQUENCE_ID_SHIFT)
+}
+
+/// Unpacks a 64-bit word into its constituent 16-bit sequence ID and 48-bit data value.
+///
+/// This is the inverse of [`sample_pack`]. It extracts the generation tag used
+/// for ghost data prevention and the actual metric value.
+fn sample_unpack(packed: u64) -> (u16, u64) {
+    let sequence_id = (packed >> SAMPLE_SEQUENCE_ID_SHIFT) as u16;
+    let data = packed & SAMPLE_DATA_MASK;
+    (sequence_id, data)
+}
+
+/// Creates a new latency histogram with a standardized range and precision.
+///
+/// # Configuration
+/// - **Range:** 1ms to 10,000ms (10 seconds).
+/// - **Precision:** 2 significant figures (guarantees $\le 1\%$ error).
+///
+/// # Returns
+/// A configured [`Histogram<u64>`].
+///
+/// # Panics
+/// Panics if the internal bounds are invalid (though 1, 10000, 2 are verified constants).
+#[inline]
+pub fn create_latency_histogram() -> Histogram<u64> {
+    const MIN_LATENCY: u64 = 1;
+    const MAX_LATENCY: u64 = 10_000;
+    const PRECISION: u8 = 2;
+
+    Histogram::new_with_bounds(MIN_LATENCY, MAX_LATENCY, PRECISION)
+        .expect("Failed to initialize latency histogram with standard bounds")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::RngExt;
     use std::sync::Barrier;
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     /// Verifies that configuration values for shards and samples are automatically
@@ -755,5 +817,87 @@ mod tests {
 
         assert_eq!(snap1.hit_count(), 1);
         assert_eq!(snap2.hit_count(), 2);
+    }
+
+    /// Integration test to verify concurrent latency accumulation, snapshot isolation,
+    /// and the efficacy of the ghost data prevention algorithm.
+    ///
+    /// This test confirms that:
+    /// 1. **Snapshot Independence:** Snapshots are point-in-time views that do not
+    ///    clear or mutate the underlying metric state, yet remain isolated by generation.
+    /// 2. **Ghost Prevention:** The 16-bit generation tag correctly identifies and
+    ///    excludes stale data from previous buffer rotations.
+    /// 3. **Statistical Integrity:** Percentiles (P50, P90, P99, P999) calculated from
+    ///    sharded, lock-free storage match a Mutex-protected ground truth.
+    /// 4. **Wait-Free Progress:** High-contention writes via a `Barrier` do not result
+    ///    in data corruption or lost updates due to bit-packing race conditions.
+    #[test]
+    fn test_metrics_collect_latency_metrics() {
+        let config = MetricsConfig::new(4, 1024);
+        let metrics = Arc::new(Metrics::new(config));
+
+        let num_threads = 10;
+        let samples_per_thread = 200;
+        let barrier = Arc::new(Barrier::new(num_threads));
+
+        for _ in 0..10 {
+            let histogram: Mutex<Histogram<u64>> = Mutex::new(create_latency_histogram());
+
+            thread::scope(|s| {
+                for _ in 0..num_threads {
+                    s.spawn({
+                        let metrics = metrics.clone();
+                        let barrier = barrier.clone();
+                        let histogram = &histogram;
+
+                        move || {
+                            let mut rng = rand::rng();
+                            let mut written_values = Vec::with_capacity(samples_per_thread);
+                            barrier.wait();
+
+                            for _ in 0..samples_per_thread {
+                                // Simulate latency between 100us and 1000us
+                                let latency = rng.random_range(100..1000);
+                                metrics.record_latency(latency);
+                                written_values.push(latency);
+                            }
+
+                            let mut guard = histogram.lock().expect("cannot acquire lock");
+
+                            for value in written_values {
+                                guard.record(value).expect("cannot write value");
+                            }
+
+                            drop(guard)
+                        }
+                    });
+                }
+            });
+
+            let snapshot = metrics.snapshot();
+
+            let percentiles = [
+                LatencyPercentile::P50,
+                LatencyPercentile::P90,
+                LatencyPercentile::P99,
+                LatencyPercentile::P999,
+            ];
+
+            let guard = histogram.lock().expect("cannot acquire the lock");
+
+            for p in percentiles {
+                let actual = snapshot.latency(p);
+                let expected = guard.value_at_quantile(p.as_quantile());
+
+                // Assert that the lock-free sampler matches the controlled histogram
+                assert!(
+                    (actual as i64 - expected as i64).abs() <= 1,
+                    "Percentile {:?} mismatch: actual {}, expected {}",
+                    p,
+                    actual,
+                    expected
+                );
+            }
+        }
     }
 }

@@ -7,11 +7,12 @@ use crate::core::key::Key;
 use crate::metrics::{Metrics, MetricsConfig, MetricsSnapshot};
 use SlotState::{Claimed, Cold, Hot, Vacant};
 use crossbeam::epoch::{Atomic, Guard, Owned, pin};
+use crossbeam_epoch::Shared;
 use dashmap::DashMap;
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::ptr::NonNull;
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicU8, AtomicUsize};
 use std::time::Instant;
 
@@ -397,6 +398,25 @@ where
     #[inline]
     fn metrics(&self) -> MetricsSnapshot {
         self.metrics.snapshot()
+    }
+}
+
+impl<K, V> Drop for ClockCache<K, V>
+where
+    K: Eq + Hash,
+{
+    fn drop(&mut self) {
+        let guard = pin();
+
+        for slot in &self.slots {
+            let shared_old = slot.entry.swap(Shared::null(), AcqRel, &guard);
+
+            if !shared_old.is_null() {
+                unsafe { guard.defer_destroy(shared_old) }
+            }
+        }
+
+        guard.flush();
     }
 }
 

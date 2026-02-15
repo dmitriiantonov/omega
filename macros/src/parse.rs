@@ -4,7 +4,7 @@ use crate::ast::{
 };
 use proc_macro2::Ident;
 use syn::parse::{Parse, ParseStream};
-use syn::token::{Brace, Token};
+use syn::token::Brace;
 use syn::{Error, Expr, Token, braced, parse_quote};
 
 const DEFAULT_SHARDS: usize = 4;
