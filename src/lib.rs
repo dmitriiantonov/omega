@@ -1,6 +1,6 @@
 pub use crate::admission::{AdmissionPolicy, AlwaysAdmission, FrequentPolicy};
 use crate::core::engine::CacheEngine;
-use crate::core::handler::Ref;
+use crate::core::entry_ref::Ref;
 use crate::core::key::Key;
 use crate::metrics::MetricsSnapshot;
 use std::borrow::Borrow;
@@ -13,6 +13,7 @@ mod cms;
 mod admission;
 pub mod core;
 pub mod metrics;
+mod s3;
 
 pub struct Cache<E, K, V, P>
 where
