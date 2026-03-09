@@ -9,13 +9,13 @@ use crate::core::ring::RingQueue;
 use crate::core::utils;
 use crate::metrics::{Metrics, MetricsConfig, MetricsSnapshot};
 use crossbeam::utils::CachePadded;
-use crossbeam_epoch::{pin, Atomic, Owned};
+use crossbeam_epoch::{Atomic, Owned, pin};
 use crossbeam_epoch::{Guard, Shared};
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::ptr::NonNull;
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::time::Instant;
 use utils::hash;
 
@@ -79,11 +79,6 @@ impl Tag {
     }
 
     #[inline]
-    fn is_cold(self) -> bool {
-        self.frequency() == 0
-    }
-
-    #[inline]
     fn is_hot(self) -> bool {
         self.frequency() > 0
     }
@@ -92,12 +87,6 @@ impl Tag {
     #[inline]
     fn is_match(self, index: Index, hash: u64) -> bool {
         self.id() == index.id() && !self.is_busy() && self.signature() == Self::make_signature(hash)
-    }
-
-    /// Returns true if the slot is logically empty and matches the version ID.
-    #[inline]
-    fn is_vacant(self, index: Index) -> bool {
-        self.id() == index.id() && !self.is_busy() && self.signature() == 0
     }
 
     /// Creates a new Tag with a specific signature based on the provided hash.
@@ -915,9 +904,8 @@ where
 mod tests {
     use super::*;
     use crossbeam::scope;
-    use fake::rand::rng;
-    use fake::Rng;
     use rand::distr::{Alphanumeric, SampleString};
+    use rand::{RngExt, rng};
 
     #[inline(always)]
     fn create_cache<K, V>(capacity: usize) -> S3FIFOCache<K, V>
