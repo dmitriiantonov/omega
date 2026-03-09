@@ -4,14 +4,14 @@ pub mod core;
 pub mod metrics;
 pub mod s3fifo;
 
-use std::borrow::Borrow;
-use std::hash::Hash;
-use std::marker::PhantomData;
 pub use crate::admission::{AdmissionPolicy, AlwaysAdmission, FrequentPolicy};
 use crate::core::engine::CacheEngine;
 use crate::core::entry_ref::Ref;
 use crate::core::key::Key;
 use crate::metrics::MetricsSnapshot;
+use std::borrow::Borrow;
+use std::hash::Hash;
+use std::marker::PhantomData;
 
 pub struct Cache<E, K, V, P>
 where
