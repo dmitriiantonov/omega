@@ -3,7 +3,7 @@
 A high-performance, concurrent cache for Rust, featuring lock-free slot management, epoch-based memory reclamation, and
 TTL support.
 
-[![Omega CI](https://github.com/dmitriiantonov/omega/actions/workflows/rust.yml/badge.svg)](https://github.com/dmitriiantonov/omega/actions/workflows/rust.yml)
+[![Omega CI](https://github.com/dmitriiantonov/omega/actions/workflows/ci.yml/badge.svg)](https://github.com/dmitriiantonov/omega/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-blue.svg)](https://www.rust-lang.org)
 
@@ -30,11 +30,11 @@ epochs, and time-to-live (TTL) for entries.
 
 ## 📦 Installation
 
-Add Omega to your `Cargo.toml` as a Git dependency:
+Add Omega to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-omega = { git = "https://github.com/dmitriiantonov/omega.git" }
+omega = "0.1.0"
 ```
 
 ## 🛠 Usage
@@ -45,7 +45,7 @@ Omega provides a powerful `cache!` macro to configure cache engines and admissio
 
 ```rust
 use omega::core::backoff::BackoffPolicy;
-use macros::cache;
+use omega::cache;
 
 let cache = cache!(
     engine: S3FIFO {
@@ -70,7 +70,7 @@ if let Some(entry) = cache.get(&"key".to_string()) {
 
 ```rust
 use omega::core::backoff::BackoffPolicy;
-use macros::cache;
+use omega::cache;
 
 let cache = cache!(
     engine: Clock {

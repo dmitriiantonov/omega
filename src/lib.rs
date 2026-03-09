@@ -9,6 +9,7 @@ use crate::core::engine::CacheEngine;
 use crate::core::entry_ref::Ref;
 use crate::core::key::Key;
 use crate::metrics::MetricsSnapshot;
+pub use macros::cache;
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -84,9 +85,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::cache;
     use crate::core::backoff::BackoffPolicy;
     use crate::core::utils::random_string;
-    use macros::cache;
     use std::thread::scope;
 
     #[test]
