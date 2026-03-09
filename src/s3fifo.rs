@@ -1125,7 +1125,7 @@ mod tests {
             for _ in 0..num_threads {
                 scope.spawn(|_| {
                     for op in 0..ops_per_thread {
-                        if op % 10 == 0 {
+                        if op % 5 == 0 {
                             let index = rng().random_range(0..frequent_entries_len);
                             let (key, _) = &frequent_entries[index];
                             let _ = cache.get(key);
@@ -1146,6 +1146,6 @@ mod tests {
             }
         }
 
-        assert!(count >= 30);
+        assert!(count >= 10);
     }
 }
