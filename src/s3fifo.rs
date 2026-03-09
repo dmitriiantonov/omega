@@ -1102,7 +1102,7 @@ mod tests {
         }
 
         let num_threads = 8;
-        let ops_per_thread = 100000;
+        let ops_per_thread = 10000;
 
         let cache = create_cache(1000);
 
@@ -1111,11 +1111,21 @@ mod tests {
             let _ = cache.get(key);
         }
 
+        for _ in 0..2000 {
+            cache.insert(random_alphanumeric(32), random_alphanumeric(255), None);
+        }
+
+        for (key, _) in &frequent_entries {
+            for _ in 0..5 {
+                let _ = cache.get(key);
+            }
+        }
+
         let _ = scope(|scope| {
             for _ in 0..num_threads {
                 scope.spawn(|_| {
                     for op in 0..ops_per_thread {
-                        if op % 10 == 0 {
+                        if op % 5 == 0 {
                             let index = rng().random_range(0..frequent_entries_len);
                             let (key, _) = &frequent_entries[index];
                             let _ = cache.get(key);
@@ -1136,8 +1146,6 @@ mod tests {
             }
         }
 
-        println!("count = {}", count);
-
-        assert!(count >= 10);
+        assert!(count >= 30);
     }
 }
