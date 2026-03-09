@@ -9,7 +9,7 @@ use crate::core::ring::RingQueue;
 use crate::core::utils;
 use crate::metrics::{Metrics, MetricsConfig, MetricsSnapshot};
 use crossbeam::utils::CachePadded;
-use crossbeam_epoch::{Atomic, Owned, pin};
+use crossbeam_epoch::{pin, Atomic, Owned};
 use crossbeam_epoch::{Guard, Shared};
 use std::borrow::Borrow;
 use std::hash::Hash;
@@ -322,6 +322,8 @@ where
         backoff_config: BackoffConfig,
         metrics_config: MetricsConfig,
     ) -> Self {
+        const GHOST_FILTER_DEPTH: usize = 4;
+
         let small_queue_capacity = (capacity as f64 * 0.1) as usize;
         let main_queue_capacity = capacity - small_queue_capacity;
 
@@ -349,7 +351,7 @@ where
             small_queue,
             ghost_queue,
             index_pool,
-            ghost_filter: CountMinSketch::new(capacity),
+            ghost_filter: CountMinSketch::new(capacity, GHOST_FILTER_DEPTH),
             backoff_config,
             metrics,
             capacity,
@@ -917,10 +919,11 @@ where
 mod tests {
     use super::*;
     use crossbeam::scope;
-    use fake::Rng;
     use fake::rand::rng;
+    use fake::Rng;
     use rand::distr::{Alphanumeric, SampleString};
 
+    #[inline(always)]
     fn create_cache<K, V>(capacity: usize) -> S3Cache<K, V>
     where
         K: Eq + Hash,
@@ -932,49 +935,63 @@ mod tests {
         )
     }
 
+    #[inline(always)]
+    fn random_alphanumeric(len: usize) -> String {
+        Alphanumeric.sample_string(&mut rand::rng(), len)
+    }
+
     #[test]
     fn test_s3cache_insert_should_retrieve_stored_value() {
         let cache = create_cache(10);
 
-        cache.insert("key", "value", None);
+        let key = random_alphanumeric(32);
+        let value = random_alphanumeric(255);
 
-        let entry = cache.get(&"key").expect("must present");
+        cache.insert(key.clone(), value.clone(), None);
 
-        assert_eq!(entry.key(), &"key");
-        assert_eq!(entry.value(), &"value");
+        let entry = cache.get(&key).expect("must present");
+
+        assert_eq!(entry.key(), &key);
+        assert_eq!(entry.value(), &value);
     }
 
     #[test]
     fn test_s3cache_insert_should_overwrite_existing_key() {
         let cache = create_cache(10);
 
-        cache.insert("key", "value1", None);
-        cache.insert("key", "value2", None);
+        let key = random_alphanumeric(32);
+        let value1 = random_alphanumeric(255);
+        let value2 = random_alphanumeric(255);
 
-        let entry = cache.get(&"key").expect("must present");
+        cache.insert(key.clone(), value1, None);
+        cache.insert(key.clone(), value2.clone(), None);
 
-        assert_eq!(entry.key(), &"key");
-        assert_eq!(entry.value(), &"value2");
+        let entry = cache.get(&key).expect("must present");
+
+        assert_eq!(entry.key(), &key);
+        assert_eq!(entry.value(), &value2);
     }
 
     #[test]
     fn test_s3cache_remove_should_invalidate_entry() {
         let cache = create_cache(100);
 
-        cache.insert("key", "value", None);
+        let key = random_alphanumeric(32);
 
-        assert!(cache.get(&"key").is_some());
+        cache.insert(key.clone(), random_alphanumeric(255), None);
 
-        assert!(cache.remove(&"key"));
+        assert!(cache.get(&key).is_some());
 
-        assert!(cache.get(&"key").is_none());
+        assert!(cache.remove(&key));
+
+        assert!(cache.get(&key).is_none());
     }
 
     #[test]
     fn test_s3cache_fill_beyond_capacity_should_evict_fifo() {
         let cache = create_cache(100);
 
-        for i in 0..1000 {
+        for _ in 0..1000 {
             let key = random_alphanumeric(32);
             let value = random_alphanumeric(255);
 
@@ -1038,10 +1055,6 @@ mod tests {
 
         assert_eq!(entry.key(), &key);
         assert_eq!(entry.value(), &value);
-    }
-
-    fn random_alphanumeric(len: usize) -> String {
-        Alphanumeric.sample_string(&mut rand::rng(), len)
     }
 
     #[test]
@@ -1131,11 +1144,15 @@ mod tests {
             }
         });
 
-        let count = frequent_entries
-            .iter()
-            .map(|(key, _)| cache.get(key))
-            .filter(|it| it.is_some())
-            .count();
+        let mut count = 0;
+
+        for (key, value) in &frequent_entries {
+
+            if let Some(entry_ref) = cache.get(key) {
+                assert_eq!(entry_ref.value(), value);
+                count += 1;
+            }
+        }
 
         assert!(count >= 45);
     }

@@ -8,7 +8,6 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 
 mod clock;
-mod cms;
 
 mod admission;
 pub mod core;
