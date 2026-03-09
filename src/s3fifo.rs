@@ -1146,6 +1146,6 @@ mod tests {
             }
         }
 
-        assert!(count >= 25);
+        assert!(count >= 30);
     }
 }
