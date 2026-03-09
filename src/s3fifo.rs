@@ -348,7 +348,7 @@ where
     /// If the entry exists and is valid, its access frequency is atomically
     /// incremented. This protects the entry from being removed during the
     /// next space-reclamation cycle.
-    fn get<Q>(&self, key: &Q) -> Option<Ref<K, V>>
+    pub fn get<Q>(&self, key: &Q) -> Option<Ref<K, V>>
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
@@ -415,21 +415,12 @@ where
         }
     }
 
-    /// Inserts a key-value pair into the cache.
-    ///
-    /// If the key's hash is recognized by the `ghost_filter`, the entry is
-    /// admitted directly into the main segment. Otherwise, it is placed
-    /// in the small segment for probation.
-    fn insert(&self, key: K, value: V, expired_at: Option<Instant>) {
-        self.insert_with(key, value, expired_at, |_, _| true);
-    }
-
     /// Handles the admission of new entries into the probationary segment.
     ///
     /// If the segment is full, this function triggers space reclamation.
     /// The entry is stored in a slot obtained from the available pool and
     /// then appended to the small queue.
-    fn insert_with(
+    pub fn insert_with(
         &self,
         key: K,
         value: V,
@@ -827,7 +818,7 @@ where
         None
     }
 
-    fn remove<Q>(&self, key: &Q) -> bool
+    pub fn remove<Q>(&self, key: &Q) -> bool
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
