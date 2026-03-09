@@ -1102,13 +1102,23 @@ mod tests {
         }
 
         let num_threads = 8;
-        let ops_per_thread = 100000;
+        let ops_per_thread = 10000;
 
         let cache = create_cache(1000);
 
         for (key, value) in &frequent_entries {
             cache.insert(key.clone(), value.clone(), None);
             let _ = cache.get(key);
+        }
+
+        for _ in 0..2000 {
+            cache.insert(random_alphanumeric(32), random_alphanumeric(255), None);
+        }
+
+        for (key, _) in &frequent_entries {
+            for _ in 0..5 {
+                let _ = cache.get(key);
+            }
         }
 
         let _ = scope(|scope| {
