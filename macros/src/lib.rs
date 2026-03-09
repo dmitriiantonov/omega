@@ -33,7 +33,7 @@ impl ToTokens for AdmissionInput {
             AdmissionInput::Frequent(frequent) => {
                 let frequent = frequent.as_ref();
                 let cms_width = &frequent.count_min_sketch.width;
-                let cms_height = &frequent.count_min_sketch.height;
+                let cms_height = &frequent.count_min_sketch.depth;
                 let decay_threshold = &frequent.decay_threshold;
 
                 let extend = quote! {
@@ -56,6 +56,15 @@ impl ToTokens for EngineInput {
 
                 tokens.extend(quote! {
                     crate::clock::ClockCache::new(#capacity, #backoff, #metrics)
+                });
+            }
+            EngineInput::S3FIFO(s3fifo) => {
+                let capacity = &s3fifo.capacity;
+                let backoff = &s3fifo.backoff;
+                let metrics = &s3fifo.metrics;
+
+                tokens.extend(quote! {
+                    crate::s3fifo::S3FIFOCache::new(#capacity, #backoff, #metrics)
                 });
             }
         }

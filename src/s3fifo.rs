@@ -15,7 +15,7 @@ use std::borrow::Borrow;
 use std::hash::Hash;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 use utils::hash;
 
@@ -246,17 +246,12 @@ impl<K, V> Slot<K, V>
 where
     K: Eq + Hash,
 {
+    #[inline(always)]
     fn new() -> Self {
         Self {
             entry: Atomic::null(),
             tag: AtomicU64::default(),
         }
-    }
-
-    #[inline]
-    fn entry<'a>(&self, order: Ordering, guard: &'a Guard) -> Option<&'a Entry<K, V>> {
-        let entry = self.entry.load(order, guard);
-        unsafe { entry.as_ref() }
     }
 }
 
@@ -264,6 +259,7 @@ impl<K, V> Default for Slot<K, V>
 where
     K: Eq + Hash,
 {
+    #[inline(always)]
     fn default() -> Self {
         Slot::new()
     }
@@ -281,7 +277,7 @@ where
 ///    re-insertion directly into the Main Queue.
 ///
 ///
-pub struct S3Cache<K, V>
+pub struct S3FIFOCache<K, V>
 where
     K: Eq + Hash,
 {
@@ -307,7 +303,7 @@ where
     capacity: usize,
 }
 
-impl<K, V> S3Cache<K, V>
+impl<K, V> S3FIFOCache<K, V>
 where
     K: Eq + Hash,
 {
@@ -879,7 +875,7 @@ where
     }
 }
 
-impl<K, V> CacheEngine<K, V> for S3Cache<K, V>
+impl<K, V> CacheEngine<K, V> for S3FIFOCache<K, V>
 where
     K: Eq + Hash,
 {
@@ -924,11 +920,11 @@ mod tests {
     use rand::distr::{Alphanumeric, SampleString};
 
     #[inline(always)]
-    fn create_cache<K, V>(capacity: usize) -> S3Cache<K, V>
+    fn create_cache<K, V>(capacity: usize) -> S3FIFOCache<K, V>
     where
         K: Eq + Hash,
     {
-        S3Cache::new(
+        S3FIFOCache::new(
             capacity,
             BackoffConfig::exponential(1000),
             MetricsConfig::default(),
@@ -1131,10 +1127,9 @@ mod tests {
             for _ in 0..num_threads {
                 scope.spawn(|_| {
                     for op in 0..ops_per_thread {
-                        if op % 25 == 0 {
+                        if op % 10 == 0 {
                             let index = rng().random_range(0..frequent_entries_len);
                             let (key, _) = &frequent_entries[index];
-
                             let _ = cache.get(key);
                         } else {
                             cache.insert(random_alphanumeric(32), random_alphanumeric(255), None);
@@ -1147,7 +1142,6 @@ mod tests {
         let mut count = 0;
 
         for (key, value) in &frequent_entries {
-
             if let Some(entry_ref) = cache.get(key) {
                 assert_eq!(entry_ref.value(), value);
                 count += 1;

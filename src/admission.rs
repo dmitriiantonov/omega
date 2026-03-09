@@ -1,10 +1,10 @@
+use crate::core::cms::CountMinSketch;
 use crate::core::key::Key;
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
-use crate::core::cms::CountMinSketch;
 
 pub trait AdmissionPolicy<K>
 where

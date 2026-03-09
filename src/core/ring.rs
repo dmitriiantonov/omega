@@ -122,7 +122,7 @@ impl RingQueue {
         loop {
             let item = &self.buffer[head & self.mask];
             let sequence = item.sequence.load(Acquire);
-            let diff = sequence as isize - (head + 1) as isize;
+            let diff = sequence as isize - head as isize - 1;
 
             match diff {
                 0 => {
