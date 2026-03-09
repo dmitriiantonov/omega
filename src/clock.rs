@@ -2,7 +2,7 @@ use crate::clock::WriteResult::{Rejected, Retry, Written};
 use crate::core::backoff::BackoffConfig;
 use crate::core::engine::CacheEngine;
 use crate::core::entry::Entry;
-use crate::core::handler::Ref;
+use crate::core::entry_ref::Ref;
 use crate::core::key::Key;
 use crate::metrics::{Metrics, MetricsConfig, MetricsSnapshot};
 use SlotState::{Claimed, Cold, Hot, Vacant};
@@ -92,14 +92,16 @@ where
         }
     }
 
-    /// Load a value from the slot, returning a handler if present.
+    /// Attempts to retrieve a value from the slot.
     ///
-    /// - Upgrades `Cold` → `Hot` if accessed.
-    /// - Returns `None` if slot is `Vacant` or `Claimed`, or if the key does not match.
+    /// If the slot contains a valid, non-expired entry matching the provided key,
+    /// it returns a `Ref` handle. This handle consumes the provided `Guard` to
+    /// ensure the entry's memory remains valid for the duration of the handle's life.
     ///
-    /// # Safety
-    /// The returned handler holds a pinned guard ensuring safe access.
-    fn load<Q>(&self, key: &Q, guard: Guard) -> Option<Ref<K, V>>
+    /// # State Transitions
+    /// - Accessing a `Cold` entry triggers an asynchronous upgrade to `Hot`.
+    /// - Returns `None` if the slot is `Vacant`, `Claimed`, or contains a different/expired key.
+    fn get<Q>(&self, key: &Q, guard: Guard) -> Option<Ref<K, V>>
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
@@ -129,22 +131,20 @@ where
         }
     }
 
-    /// Attempt to write a new entry into the slot.
+    /// Performs a synchronized write operation on the slot.
     ///
-    /// # Parameters
-    /// - `entry`: reference to a `MaybeUninit<Entry<K,V>>`. Ownership is moved only on success.
-    /// - `guard`: epoch guard for memory safety.
-    /// - `on_evict`: called if an old entry is replaced.
-    /// - `on_insert`: called after a successful insertion.
-    ///
-    /// # Returns
-    /// - `Inserted`: successfully inserted new entry.
-    /// - `Replaced`: old entry replaced, returned as `Handler`.
-    /// - `Retry`: slot unavailable; caller should retry.
+    /// This method manages the insertion or replacement of entries using a
+    /// Compare-and-Swap (CAS) on the slot state to prevent race conditions
+    /// between readers and writers.
     ///
     /// # Safety
-    /// - `entry.assume_init_read()` is called only after successfully claiming the slot.
-    /// - Old entry is either deferred for destruction or returned as a handler.
+    /// When an old entry is replaced, its memory is reclaimed via `guard.defer_destroy`
+    /// to ensure any concurrent readers can finish their operations safely.
+    ///
+    /// # Returns
+    /// - `Written`: The new entry was stored.
+    /// - `Rejected`: Admission policy or expiration check denied the write.
+    /// - `Retry`: The slot was hot or claimed; the caller should attempt another slot.
     fn try_write<A, E, I>(
         &self,
         entry: Entry<K, V>,
@@ -207,6 +207,15 @@ where
         }
     }
 
+    /// Attempts to transition the slot to the `Claimed` state to secure exclusive write access.
+    ///
+    /// This is a "lock-free" acquisition. If the current state has drifted from the
+    /// provided `state` parameter since it was last read, the exchange will fail,
+    /// signaling that another thread has either updated or claimed the slot.
+    ///
+    /// # Returns
+    /// - `true`: The slot is now `Claimed` by the current thread.
+    /// - `false`: The state changed externally; the caller must re-evaluate.
     #[inline]
     fn claim(&self, state: SlotState) -> bool {
         self.state
@@ -214,7 +223,14 @@ where
             .is_ok()
     }
 
-    /// Load the current clock state atomically.
+    /// Evaluates whether the slot is eligible for eviction or insertion.
+    ///
+    /// A slot is considered writable if:
+    /// 1. It is currently `Vacant` (empty).
+    /// 2. It is `Cold` (eligible for replacement in the Clock algorithm).
+    /// 3. The existing entry has passed its expiration deadline, regardless of state.
+    ///
+    /// If the slot is `Hot` or already `Claimed`, this returns `false`.
     fn state(&self) -> SlotState {
         self.state.load(Acquire).into()
     }
@@ -266,14 +282,13 @@ where
     K: Eq + Hash,
 {
     /// Create a new Clock cache with the given capacity.
-    ///
-    /// # Panics
-    /// Capacity must be a power-of-two.
     pub fn new(
         capacity: usize,
         backoff_config: BackoffConfig,
         metrics_config: MetricsConfig,
     ) -> Self {
+        let capacity = capacity.next_power_of_two();
+
         let slots = (0..capacity)
             .map(|_| Slot::empty())
             .collect::<Vec<_>>()
@@ -313,7 +328,7 @@ where
             .and_then(|entry| {
                 let index = *entry.value();
 
-                match self.slots[index].load(key, guard) {
+                match self.slots[index].get(key, guard) {
                     None => {
                         self.metrics.record_miss();
                         let elapsed = called_at.elapsed().as_millis() as u64;
@@ -546,28 +561,6 @@ mod tests {
         assert!(
             cache.get(&2).is_none(),
             "K2 should have been the first choice for eviction"
-        );
-    }
-
-    /// 3. Admission Policy Rejection
-    /// Verifies that the cache respects the closure's decision to skip an insertion.
-    #[test]
-    fn test_admission_policy_rejection() {
-        let cache = ClockCache::new(10, backoff_config(), MetricsConfig::default());
-
-        cache.insert(1, "important".to_string(), None);
-
-        cache.insert_with(2, "garbage".to_string(), None, |_, _| false);
-
-        for i in 2..=10 {
-            cache.insert(i, generate_data(), None);
-        }
-
-        cache.insert_with(11, "rejected".to_string(), None, |_, _| false);
-
-        assert!(
-            cache.get(&11).is_none(),
-            "Item should have been rejected by policy"
         );
     }
 

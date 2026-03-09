@@ -7,9 +7,16 @@ pub struct CacheInput {
 
 pub enum EngineInput {
     Clock(Box<ClockInput>),
+    S3FIFO(Box<S3FIFOInput>),
 }
 
 pub struct ClockInput {
+    pub capacity: Expr,
+    pub backoff: BackoffInput,
+    pub metrics: MetricsInput,
+}
+
+pub struct S3FIFOInput {
     pub capacity: Expr,
     pub backoff: BackoffInput,
     pub metrics: MetricsInput,
@@ -32,7 +39,7 @@ pub struct FrequentAdmissionInput {
 
 pub struct CountMinSketchInput {
     pub width: Expr,
-    pub height: Expr,
+    pub depth: Expr,
 }
 
 pub struct MetricsInput {

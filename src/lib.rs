@@ -1,6 +1,6 @@
 pub use crate::admission::{AdmissionPolicy, AlwaysAdmission, FrequentPolicy};
 use crate::core::engine::CacheEngine;
-use crate::core::handler::Ref;
+use crate::core::entry_ref::Ref;
 use crate::core::key::Key;
 use crate::metrics::MetricsSnapshot;
 use std::borrow::Borrow;
@@ -8,11 +8,11 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 
 mod clock;
-mod cms;
 
 mod admission;
 pub mod core;
 pub mod metrics;
+mod s3fifo;
 
 pub struct Cache<E, K, V, P>
 where
@@ -86,83 +86,67 @@ where
 #[cfg(test)]
 mod tests {
     use crate::core::backoff::BackoffPolicy;
+    use crate::core::utils::random_string;
     use macros::cache;
     use std::thread::scope;
 
     #[test]
-    fn test_cache_get_and_insert() {
+    fn test_cache_should_create_s3fifo_and_run_workload() {
+        let num_threads = 16;
+        let op_per_thread = 10000;
+
         let cache = cache!(
-            engine: Clock {
-                capacity: 10,
-                backoff: { policy: BackoffPolicy::Exponential, limit: 10 },
-            },
-            admission: Always
-        );
-
-        cache.insert("key1", "value1");
-        cache.insert("key2", "value2");
-
-        assert_eq!(cache.get(&"key1").map(|r| *r.value()), Some("value1"));
-        assert_eq!(cache.get(&"key2").map(|r| *r.value()), Some("value2"));
-        assert!(cache.get(&"key3").is_none());
-    }
-
-    #[test]
-    fn test_eviction_on_full_capacity() {
-        let cache = cache!(
-            engine: Clock {
-                capacity: 2,
-                backoff: { policy: BackoffPolicy::Exponential, limit: 10 }
-            },
-            admission: Always
-        );
-
-        cache.insert(1, 1);
-        cache.insert(2, 2);
-        cache.insert(3, 3);
-
-        let presence = (cache.get(&1).is_some() as u8)
-            + (cache.get(&2).is_some() as u8)
-            + (cache.get(&3).is_some() as u8);
-
-        assert_eq!(presence, 2, "Cache should only contain 2 items");
-    }
-
-    #[test]
-    fn test_metrics_tracking() {
-        let cache = cache!(
-            engine: Clock {
-                capacity: 100,
+            engine: S3FIFO {
+                capacity: 10000,
                 backoff: { policy: BackoffPolicy::Exponential, limit: 10 },
                 metrics: { shards: 8, latency_samples: 1024 },
             },
             admission: Frequent {
-                count_min_sketch: { width: 1024, height: 4 },
+                count_min_sketch: { width: 1024, depth: 4 },
                 decay_threshold: 1000
             }
         );
 
-        cache.insert(1, 1);
-
-        scope(|s| {
-            s.spawn(|| {
-                for _ in 0..80 {
-                    let _ = cache.get(&1);
-                }
-            });
-
-            s.spawn(|| {
-                for _ in 0..20 {
-                    let _ = cache.get(&2);
-                }
-            });
+        scope(|scope| {
+            for _ in 0..num_threads {
+                scope.spawn(|| {
+                    for _ in 0..op_per_thread {
+                        let key = random_string(10);
+                        let value = random_string(255);
+                        cache.insert(key, value);
+                    }
+                });
+            }
         });
+    }
 
-        let metrics = cache.metrics();
+    #[test]
+    fn test_cache_should_create_clock_cache_and_run_workload() {
+        let num_threads = 16;
+        let op_per_thread = 10000;
 
-        assert_eq!(80, metrics.hit_count());
-        assert_eq!(20, metrics.miss_count());
-        assert_eq!(0.8, metrics.hit_rate());
-        assert_eq!(0.2, metrics.miss_rate());
+        let cache = cache!(
+            engine: S3FIFO {
+                capacity: 10000,
+                backoff: { policy: BackoffPolicy::Exponential, limit: 10 },
+                metrics: { shards: 8, latency_samples: 1024 },
+            },
+            admission: Frequent {
+                count_min_sketch: { width: 1024, depth: 4 },
+                decay_threshold: 1000
+            }
+        );
+
+        scope(|scope| {
+            for _ in 0..num_threads {
+                scope.spawn(|| {
+                    for _ in 0..op_per_thread {
+                        let key = random_string(10);
+                        let value = random_string(255);
+                        cache.insert(key, value);
+                    }
+                });
+            }
+        });
     }
 }

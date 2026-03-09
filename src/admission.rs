@@ -1,4 +1,4 @@
-use crate::cms::CountMinSketch;
+use crate::core::cms::CountMinSketch;
 use crate::core::key::Key;
 use std::borrow::Borrow;
 use std::hash::Hash;
@@ -37,9 +37,9 @@ where
     K: Eq + Hash,
 {
     #[inline]
-    pub fn new(cms_width: usize, cms_height: usize, threshold: usize) -> Self {
+    pub fn new(cms_width: usize, cms_depth: usize, threshold: usize) -> Self {
         Self {
-            cms: CountMinSketch::new(cms_width, cms_height),
+            cms: CountMinSketch::new(cms_width, cms_depth),
             count: Default::default(),
             last_decay: Default::default(),
             threshold,
@@ -76,7 +76,7 @@ where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash,
     {
-        self.cms.inc(key);
+        self.cms.increment(key);
         self.maybe_decay();
     }
 
@@ -85,8 +85,8 @@ where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash,
     {
-        let candidate_frequency = self.cms.frequency(candidate);
-        let victim_frequency = self.cms.frequency(victim);
+        let candidate_frequency = self.cms.get(candidate);
+        let victim_frequency = self.cms.get(victim);
         candidate_frequency >= victim_frequency
     }
 }

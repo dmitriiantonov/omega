@@ -1,6 +1,7 @@
 use crate::core::entry::Entry;
 use crossbeam::epoch::Guard;
 use std::hash::Hash;
+use std::ops::Deref;
 use std::ptr::NonNull;
 
 /// A guarded pointer to a cache [Entry].
@@ -31,36 +32,45 @@ where
     /// # Safety
     /// The `ptr` must be valid and must have been pinned by the provided `guard`.
     #[inline]
-    pub fn new(ptr: NonNull<Entry<K, V>>, guard: Guard) -> Self {
+    pub(crate) fn new(ptr: NonNull<Entry<K, V>>, guard: Guard) -> Self {
         Self { ptr, _guard: guard }
     }
 
+    /// Access the underlying entry.
+    /// Using a private method helps centralize the unsafe dereference.
+    #[inline]
+    fn as_entry(&self) -> &Entry<K, V> {
+        // SAFETY: The existence of _guard ensures the epoch is pinned,
+        // preventing the cache from reclaiming this Entry.
+        unsafe { self.ptr.as_ref() }
+    }
+
     /// Returns a shared reference to the entry's key.
-    ///
-    /// # Safety
-    /// This is safe because the internal epoch guard prevents the entry
-    /// from being reclaimed while this `EntryRef` exists.
     #[inline]
     pub fn key(&self) -> &K {
-        // SAFETY: The internal _guard ensures the memory at ptr is not deallocated.
-        unsafe { self.ptr.as_ref() }.key().as_ref()
+        self.as_entry().key()
     }
 
     /// Returns a shared reference to the entry's value.
-    ///
-    /// # Safety
-    /// Safe to call as long as the `EntryRef` is alive, as the memory
-    /// is pinned by the epoch guard.
     #[inline]
     pub fn value(&self) -> &V {
-        // SAFETY: The internal _guard ensures the memory at ptr is not deallocated.
-        unsafe { self.ptr.as_ref() }.value()
+        self.as_entry().value()
     }
 
     /// Returns `true` if the underlying entry has passed its expiration deadline.
     #[inline]
     pub fn is_expired(&self) -> bool {
-        // SAFETY: The internal _guard ensures the memory at ptr is not deallocated.
-        unsafe { self.ptr.as_ref() }.is_expired()
+        self.as_entry().is_expired()
+    }
+}
+
+impl<K, V> Deref for Ref<K, V>
+where
+    K: Eq + Hash,
+{
+    type Target = Entry<K, V>;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.ptr.as_ref() }
     }
 }

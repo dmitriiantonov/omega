@@ -96,6 +96,24 @@ pub struct BackoffConfig {
     pub limit: usize,
 }
 
+impl BackoffConfig {
+    #[inline(always)]
+    pub fn linear(limit: usize) -> BackoffConfig {
+        Self {
+            policy: BackoffPolicy::Linear,
+            limit,
+        }
+    }
+
+    #[inline(always)]
+    pub fn exponential(limit: usize) -> BackoffConfig {
+        Self {
+            policy: BackoffPolicy::Exponential,
+            limit,
+        }
+    }
+}
+
 /// Defines how the backoff duration scales after each failed attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackoffPolicy {

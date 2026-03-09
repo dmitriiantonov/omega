@@ -1,6 +1,6 @@
 use crate::ast::{
     AdmissionInput, BackoffInput, CacheInput, ClockInput, CountMinSketchInput, EngineInput,
-    FrequentAdmissionInput, MetricsInput,
+    FrequentAdmissionInput, MetricsInput, S3FIFOInput,
 };
 use proc_macro2::Ident;
 use syn::parse::{Parse, ParseStream};
@@ -69,7 +69,7 @@ impl Parse for CountMinSketchInput {
         braced!(content in input);
 
         let mut width = None;
-        let mut height = None;
+        let mut depth = None;
 
         while !content.is_empty() {
             let key: Ident = content.parse()?;
@@ -84,13 +84,13 @@ impl Parse for CountMinSketchInput {
                     let value = content.parse::<Expr>()?;
                     width = Some(value)
                 }
-                "height" => {
-                    if height.is_some() {
-                        return Err(Error::new(key.span(), "duplicate 'height' field"));
+                "depth" => {
+                    if depth.is_some() {
+                        return Err(Error::new(key.span(), "duplicate 'depth' field"));
                     }
 
                     let value = content.parse::<Expr>()?;
-                    height = Some(value)
+                    depth = Some(value)
                 }
                 _ => {
                     return Err(Error::new(
@@ -106,9 +106,9 @@ impl Parse for CountMinSketchInput {
         }
 
         let width = width.ok_or_else(|| Error::new(input.span(), "field 'width' is missing"))?;
-        let height = height.ok_or_else(|| Error::new(input.span(), "field 'height' is missing"))?;
+        let depth = depth.ok_or_else(|| Error::new(input.span(), "field 'height' is missing"))?;
 
-        Ok(Self { width, height })
+        Ok(Self { width, depth })
     }
 }
 
@@ -245,6 +245,76 @@ impl Parse for EngineInput {
                 });
 
                 Ok(EngineInput::Clock(Box::new(ClockInput {
+                    capacity,
+                    backoff,
+                    metrics,
+                })))
+            }
+            "S3FIFO" => {
+                if !input.peek(Brace) {
+                    return Err(Error::new(input.span(), "missing the brace block"));
+                }
+
+                let content;
+                braced!(content in input);
+
+                let mut capacity = None;
+                let mut backoff = None;
+                let mut metrics = None;
+
+                while !content.is_empty() {
+                    let key = content.parse::<Ident>()?;
+                    let _ = content.parse::<Token![:]>()?;
+
+                    match key.to_string().as_str() {
+                        "capacity" => {
+                            if capacity.is_some() {
+                                return Err(Error::new(key.span(), "field capacity is duplicate"));
+                            }
+
+                            let value = content.parse::<Expr>()?;
+                            capacity = Some(value);
+                        }
+                        "backoff" => {
+                            if backoff.is_some() {
+                                return Err(Error::new(key.span(), "field backoff is duplicate"));
+                            }
+
+                            let value = content.parse::<BackoffInput>()?;
+                            backoff = Some(value);
+                        }
+                        "metrics" => {
+                            if metrics.is_some() {
+                                return Err(Error::new(key.span(), "field metrics is duplicate"));
+                            }
+
+                            let value = content.parse::<MetricsInput>()?;
+                            metrics = Some(value)
+                        }
+                        _ => {
+                            return Err(Error::new(
+                                key.span(),
+                                format!("field '${key}' is not recognized"),
+                            ));
+                        }
+                    }
+
+                    if content.peek(Token![,]) {
+                        let _ = content.parse::<Token![,]>()?;
+                    }
+                }
+
+                let capacity = capacity
+                    .ok_or_else(|| Error::new(content.span(), "field 'capacity' is missing"))?;
+                let backoff = backoff
+                    .ok_or_else(|| Error::new(content.span(), "field 'backoff' is missing"))?;
+
+                let metrics = metrics.unwrap_or_else(|| MetricsInput {
+                    shards: parse_quote!(#DEFAULT_SHARDS),
+                    latency_samples: parse_quote!(#DEFAULT_LATENCY_SAMPLES),
+                });
+
+                Ok(EngineInput::S3FIFO(Box::new(S3FIFOInput {
                     capacity,
                     backoff,
                     metrics,
