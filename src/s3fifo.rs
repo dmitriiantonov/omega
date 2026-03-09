@@ -1136,8 +1136,6 @@ mod tests {
             }
         }
 
-        println!("count = {}", count);
-
-        assert!(count >= 10);
+        assert!(count >= 30);
     }
 }
