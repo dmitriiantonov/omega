@@ -368,7 +368,6 @@ dependencies = [
  "hdrhistogram",
  "macros",
  "rand 0.10.0",
- "smallvec",
  "twox-hash",
 ]
 
