@@ -894,9 +894,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossbeam::scope;
+    use crate::core::utils::random_string;
+    use crate::core::workload::{WorkloadGenerator, WorkloadStatistics};
     use rand::distr::{Alphanumeric, SampleString};
     use rand::{RngExt, rng};
+    use std::thread::scope;
 
     #[inline(always)]
     fn create_cache<K, V>(capacity: usize) -> S3FIFOCache<K, V>
@@ -1083,60 +1085,56 @@ mod tests {
     }
 
     #[test]
-    fn test_s3cache_concurrent_should_protect_frequent_entries() {
-        let frequent_entries_len = 50;
-        let mut frequent_entries = Vec::with_capacity(frequent_entries_len);
-
-        for _ in 0..frequent_entries_len {
-            let key = random_alphanumeric(32);
-            frequent_entries.push((key, random_alphanumeric(255)));
-        }
+    fn test_s3_fifo_should_protect_hot_set_under_high_churn() {
+        let capacity = 1000;
+        let cache = create_cache(capacity);
 
         let num_threads = 8;
         let ops_per_thread = 10000;
 
-        let cache = create_cache(1000);
+        let workload_generator = WorkloadGenerator::new(20000, 1.3);
+        let workload_statistics = WorkloadStatistics::new();
 
-        for (key, value) in &frequent_entries {
-            cache.insert(key.clone(), value.clone(), None);
-            let _ = cache.get(key);
+        let mut rand = rng();
+        for _ in 0..capacity {
+            let key = workload_generator.key(&mut rand);
+            cache.insert(key.to_string(), random_string(), None);
+            workload_statistics.record(key.to_string());
         }
 
-        for _ in 0..2000 {
-            cache.insert(random_alphanumeric(32), random_alphanumeric(255), None);
-        }
-
-        for (key, _) in &frequent_entries {
-            for _ in 0..5 {
-                let _ = cache.get(key);
-            }
-        }
-
-        let _ = scope(|scope| {
+        scope(|scope| {
             for _ in 0..num_threads {
-                scope.spawn(|_| {
-                    for op in 0..ops_per_thread {
-                        if op % 5 == 0 {
-                            let index = rng().random_range(0..frequent_entries_len);
-                            let (key, _) = &frequent_entries[index];
-                            let _ = cache.get(key);
-                        } else {
-                            cache.insert(random_alphanumeric(32), random_alphanumeric(255), None);
+                scope.spawn(|| {
+                    let mut thread_rng = rng();
+                    for _ in 0..ops_per_thread {
+                        let key = workload_generator.key(&mut thread_rng);
+                        workload_statistics.record(key.to_string());
+
+                        if cache.get(key).is_none() {
+                            let value = random_string();
+                            cache.insert(key.to_string(), value, None);
                         }
                     }
                 });
             }
         });
 
-        let mut count = 0;
+        let top_keys_size = 500;
+        let frequent_keys = workload_statistics.frequent_keys(top_keys_size);
 
-        for (key, value) in &frequent_entries {
-            if let Some(entry_ref) = cache.get(key) {
-                assert_eq!(entry_ref.value(), value);
-                count += 1;
+        let count = frequent_keys.iter().fold(0, |acc, key| {
+            if cache.get(key).is_some() {
+                acc + 1
+            } else {
+                acc
             }
-        }
+        });
 
-        assert!(count >= 30);
+        assert!(
+            count >= 400,
+            "S3-FIFO efficiency dropped! Captured only {}/{} hot keys",
+            count,
+            top_keys_size
+        );
     }
 }
