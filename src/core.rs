@@ -7,3 +7,6 @@ pub mod index;
 pub mod key;
 pub mod ring;
 pub mod utils;
+
+#[cfg(test)]
+pub mod workload;
