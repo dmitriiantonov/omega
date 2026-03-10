@@ -1,10 +1,10 @@
 [package]
-name = "macros"
-version = "0.1.0"
+name = "omega-cache-macros"
+version = "0.2.1"
 edition = "2024"
-description = "Procedural macros for the omega cache library"
+description = "Procedural macros for the omega-cache library"
 license = "MIT"
-repository = "https://github.com/dmitriiantonov/omega"
+repository = "https://github.com/dmitriiantonov/omega-cache"
 
 [lib]
 proc-macro = true

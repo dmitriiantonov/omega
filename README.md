@@ -1,15 +1,15 @@
-# ⚡️ Omega
+# ⚡️ Omega Cache
 
 A high-performance, concurrent cache for Rust, featuring lock-free slot management, epoch-based memory reclamation, and
 TTL support.
 
-[![Omega CI](https://github.com/dmitriiantonov/omega/actions/workflows/ci.yml/badge.svg)](https://github.com/dmitriiantonov/omega/actions/workflows/ci.yml)
+[![Omega Cache CI](https://github.com/dmitriiantonov/omega-cache/actions/workflows/ci.yml/badge.svg)](https://github.com/dmitriiantonov/omega-cache/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-blue.svg)](https://www.rust-lang.org)
 
 ## 🚀 Overview
 
-Omega is a flexible, concurrent caching library designed for high-performance applications in Rust. It provides a
+Omega Cache is a flexible, concurrent caching library designed for high-performance applications in Rust. It provides a
 generic cache interface with pluggable engines and admission policies, allowing
 customization for different use cases. The cache supports lock-free operations, efficient memory management using
 epochs, and time-to-live (TTL) for entries.
@@ -30,22 +30,22 @@ epochs, and time-to-live (TTL) for entries.
 
 ## 📦 Installation
 
-Add Omega to your `Cargo.toml`:
+Add Omega Cache to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-omega = "0.1.0"
+omega-cache = "0.2.1"
 ```
 
 ## 🛠 Usage
 
-Omega provides a powerful `cache!` macro to configure cache engines and admission policies.
+Omega Cache provides a powerful `cache!` macro to configure cache engines and admission policies.
 
 ### 🧩 Example: S3FIFO with Frequent Admission
 
 ```rust
-use omega::core::backoff::BackoffPolicy;
-use omega::cache;
+use omega_cache::core::backoff::BackoffPolicy;
+use omega_cache::cache;
 
 let cache = cache!(
     engine: S3FIFO {
@@ -69,8 +69,8 @@ if let Some(entry) = cache.get(&"key".to_string()) {
 ### 🧩 Example: Clock with Always Admission
 
 ```rust
-use omega::core::backoff::BackoffPolicy;
-use omega::cache;
+use omega_cache::core::backoff::BackoffPolicy;
+use omega_cache::cache;
 
 let cache = cache!(
     engine: Clock {
@@ -98,7 +98,8 @@ The `Ref` type is a smart pointer that keeps the entry's memory pinned during it
 
 ## 📈 Metrics
 
-Omega tracks comprehensive performance metrics with low overhead using sharded counters and HDR histograms for latency:
+Omega Cache tracks comprehensive performance metrics with low overhead using sharded counters and HDR histograms for
+latency:
 
 - **Hit/Miss Rate**: Track the effectiveness of your eviction policy.
 - **Eviction Count**: Monitor how often entries are being pushed out.

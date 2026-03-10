@@ -9,7 +9,7 @@ use crate::core::engine::CacheEngine;
 use crate::core::entry_ref::Ref;
 use crate::core::key::Key;
 use crate::metrics::MetricsSnapshot;
-pub use macros::cache;
+pub use omega_cache_macros::cache;
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::marker::PhantomData;

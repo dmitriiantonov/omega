@@ -1,13 +1,13 @@
 [package]
-name = "omega"
-version = "0.1.0"
+name = "omega-cache"
+version = "0.2.1"
 edition = "2024"
-authors = ["Dmitrii Antonov <dmitrii.antonov@example.com>"]
+authors = ["Dmitrii Antonov"]
 description = "A high-performance, concurrent cache for Rust with lock-free slot management and pluggable eviction policies."
 license = "MIT"
-repository = "https://github.com/dmitriiantonov/omega"
-homepage = "https://github.com/dmitriiantonov/omega"
-documentation = "https://docs.rs/omega"
+repository = "https://github.com/dmitriiantonov/omega-cache"
+homepage = "https://github.com/dmitriiantonov/omega-cache"
+documentation = "https://docs.rs/omega-cache"
 readme = "README.md"
 keywords = ["cache", "concurrent", "lock-free", "s3fifo", "lru"]
 categories = ["caching", "concurrency"]
@@ -18,7 +18,7 @@ crossbeam = "0.8.4"
 dashmap = "7.0.0-rc2"
 twox-hash = "2.1.2"
 fastrand = "2.3.0"
-macros = { version = "0.1.0", path = "macros" }
+omega-cache-macros = { path = "macros" }
 crossbeam-epoch = "0.9.18"
 hdrhistogram = "7.5.4"
 rand_distr = "0.6.0"
