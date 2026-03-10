@@ -498,41 +498,90 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fake::Fake;
-
-    use fake::faker::lorem::en::Word;
-    use std::sync::{Arc, Barrier};
-    use std::thread;
+    use crate::core::utils::{random_string, random_string_with_len};
+    use crate::core::workload::{WorkloadGenerator, WorkloadStatistics};
+    use rand::distr::{Alphanumeric, SampleString};
+    use rand::{RngExt, rng};
+    use std::thread::scope;
     use std::time::{Duration, Instant};
 
-    fn backoff_config() -> BackoffConfig {
-        BackoffConfig {
-            policy: crate::core::backoff::BackoffPolicy::Exponential,
-            limit: 10,
-        }
-    }
-
-    fn generate_data() -> String {
-        Word().fake()
-    }
-
-    /// 1. Ghost Reference Safety
-    /// Verifies that EntryRef (Epoch Guard) protects memory even after eviction.
-    #[test]
-    fn test_ghost_reference_safety() {
-        let cache = Arc::new(ClockCache::new(
-            2,
-            backoff_config(),
+    #[inline(always)]
+    fn create_cache<K, V>(capacity: usize) -> ClockCache<K, V>
+    where
+        K: Eq + Hash,
+    {
+        ClockCache::new(
+            capacity,
+            BackoffConfig::exponential(1000),
             MetricsConfig::default(),
-        ));
-        let (key, value) = (generate_data(), generate_data());
+        )
+    }
+
+    #[inline(always)]
+    fn random_alphanumeric(len: usize) -> String {
+        Alphanumeric.sample_string(&mut rand::rng(), len)
+    }
+
+    #[test]
+    fn test_clock_cache_insert_should_retrieve_stored_value() {
+        let cache = create_cache(10);
+
+        let key = random_alphanumeric(32);
+        let value = random_alphanumeric(255);
+
+        cache.insert(key.clone(), value.clone(), None);
+
+        let entry = cache.get(&key).expect("must present");
+
+        assert_eq!(entry.key(), &key);
+        assert_eq!(entry.value(), &value);
+    }
+
+    #[test]
+    fn test_clock_cache_insert_should_overwrite_existing_key() {
+        let cache = create_cache(10);
+
+        let key = random_alphanumeric(32);
+        let value1 = random_alphanumeric(255);
+        let value2 = random_alphanumeric(255);
+
+        cache.insert(key.clone(), value1, None);
+        cache.insert(key.clone(), value2.clone(), None);
+
+        let entry = cache.get(&key).expect("must present");
+
+        assert_eq!(entry.key(), &key);
+        assert_eq!(entry.value(), &value2);
+    }
+
+    #[test]
+    fn test_clock_cache_remove_should_invalidate_entry() {
+        let cache = create_cache(100);
+
+        let key = random_alphanumeric(32);
+
+        cache.insert(key.clone(), random_alphanumeric(255), None);
+
+        assert!(cache.get(&key).is_some());
+
+        assert!(cache.remove(&key));
+
+        assert!(cache.get(&key).is_none());
+    }
+
+    #[test]
+    fn test_clock_cache_ghost_reference_safety_should_protect_memory() {
+        let cache = create_cache(2);
+
+        let key = random_alphanumeric(32);
+        let value = random_alphanumeric(255);
 
         cache.insert(key.clone(), value.clone(), None);
 
         let entry_ref = cache.get(&key).expect("key should present");
 
         for _ in 0..10000 {
-            let (key, value) = (generate_data(), generate_data());
+            let (key, value) = (random_alphanumeric(32), random_alphanumeric(255));
             cache.insert(key, value, None);
         }
 
@@ -541,18 +590,16 @@ mod tests {
         assert_eq!(entry_ref.value(), &value);
     }
 
-    /// 2. Second-Chance (Clock) Logic
-    /// Verifies that accessed (Hot) items survive eviction longer than Cold items.
     #[test]
-    fn test_clock_eviction_priority() {
-        let cache = ClockCache::new(2, backoff_config(), MetricsConfig::default());
+    fn test_clock_cache_hot_entry_should_resist_eviction() {
+        let cache = create_cache(2);
 
-        cache.insert(1, generate_data(), None);
-        cache.insert(2, generate_data(), None);
+        cache.insert(1, random_alphanumeric(32), None);
+        cache.insert(2, random_alphanumeric(32), None);
 
         let _ = cache.get(&1);
 
-        cache.insert(3, generate_data(), None);
+        cache.insert(3, random_alphanumeric(32), None);
 
         assert!(
             cache.get(&1).is_some(),
@@ -564,11 +611,9 @@ mod tests {
         );
     }
 
-    /// 4. TTL Expiration
-    /// Verifies that the public API hides expired items.
     #[test]
-    fn test_ttl_expiration() {
-        let cache = ClockCache::new(10, backoff_config(), MetricsConfig::default());
+    fn test_clock_cache_ttl_expiration_should_hide_expired_items() {
+        let cache = create_cache(10);
         let short_lived = Duration::from_millis(50);
         let (key, value) = ("key".to_string(), "value".to_string());
 
@@ -579,7 +624,7 @@ mod tests {
         );
         assert!(cache.get(&key).is_some());
 
-        thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(100));
 
         assert!(
             cache.get(&key).is_none(),
@@ -588,35 +633,74 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_hammer() {
-        let cache = Arc::new(ClockCache::new(
-            64,
-            backoff_config(),
-            MetricsConfig::default(),
-        ));
-        let threads = 8;
-        let ops = 1000;
-        let barrier = Arc::new(Barrier::new(threads));
+    fn test_clock_cache_concurrent_hammer_should_not_crash_or_hang() {
+        let cache = create_cache(64);
+        let num_threads = 8;
+        let ops_per_thread = 1000;
 
-        let mut handles = vec![];
-        for t in 0..threads {
-            let c = Arc::clone(&cache);
-            let b = Arc::clone(&barrier);
-            handles.push(thread::spawn(move || {
-                b.wait();
-                for i in 0..ops {
-                    let key = (t * 100) + (i % 50); // Mix of private and shared keys
-                    c.insert(key, i, None);
-                    let _ = c.get(&key);
-                    if i % 10 == 0 {
-                        c.remove(&key);
+        scope(|s| {
+            for t in 0..num_threads {
+                let cache = &cache;
+                s.spawn(move || {
+                    for i in 0..ops_per_thread {
+                        let key = (t * 100) + (i % 50); // Mix of private and shared keys
+                        cache.insert(key, i, None);
+                        let _ = cache.get(&key);
+                        if i % 10 == 0 {
+                            cache.remove(&key);
+                        }
                     }
-                }
-            }));
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn test_clock_cache_should_preserve_hot_set() {
+        let capacity = 1000;
+        let cache = create_cache(capacity);
+
+        let num_threads = 8;
+        let ops_per_thread = 15_000;
+        let workload_generator = WorkloadGenerator::new(10000, 1.2);
+        let workload_statistics = WorkloadStatistics::new();
+
+        let mut rand = rng();
+
+        for _ in 0..capacity {
+            let key = workload_generator.key(&mut rand);
+            cache.insert(key.to_string(), random_string(), None);
+            workload_statistics.record(key.to_string());
         }
 
-        for h in handles {
-            h.join().expect("Thread panicked");
-        }
+        scope(|scope| {
+            for _ in 0..num_threads {
+                scope.spawn(|| {
+                    let mut rand = rng();
+                    for _ in 0..ops_per_thread {
+                        let key = workload_generator.key(&mut rand);
+
+                        if cache.get(key).is_none() {
+                            let value = random_string_with_len(rand.random_range(100..255));
+                            cache.insert(key.to_string(), value, None);
+                            workload_statistics.record(key.to_string());
+                        }
+                    }
+                });
+            }
+        });
+
+        let count = workload_statistics
+            .frequent_keys(500)
+            .iter()
+            .fold(0, |acc, key| {
+                if cache.get(key).is_some() {
+                    acc + 1
+                } else {
+                    acc
+                }
+            });
+
+        assert!(count >= 250)
     }
 }

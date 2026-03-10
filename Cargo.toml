@@ -21,6 +21,4 @@ fastrand = "2.3.0"
 macros = { version = "0.1.0", path = "macros" }
 crossbeam-epoch = "0.9.18"
 hdrhistogram = "7.5.4"
-
-[dev-dependencies]
-fake = "4.4.0"
+rand_distr = "0.6.0"

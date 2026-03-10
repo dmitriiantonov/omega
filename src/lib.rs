@@ -87,7 +87,7 @@ where
 mod tests {
     use crate::cache;
     use crate::core::backoff::BackoffPolicy;
-    use crate::core::utils::random_string;
+    use crate::core::utils::random_string_with_len;
     use std::thread::scope;
 
     #[test]
@@ -111,8 +111,8 @@ mod tests {
             for _ in 0..num_threads {
                 scope.spawn(|| {
                     for _ in 0..op_per_thread {
-                        let key = random_string(10);
-                        let value = random_string(255);
+                        let key = random_string_with_len(10);
+                        let value = random_string_with_len(255);
                         cache.insert(key, value);
                     }
                 });
@@ -141,8 +141,8 @@ mod tests {
             for _ in 0..num_threads {
                 scope.spawn(|| {
                     for _ in 0..op_per_thread {
-                        let key = random_string(10);
-                        let value = random_string(255);
+                        let key = random_string_with_len(10);
+                        let value = random_string_with_len(255);
                         cache.insert(key, value);
                     }
                 });
