@@ -1,4 +1,6 @@
+#[cfg(test)]
 use rand::distr::{Alphanumeric, SampleString};
+#[cfg(test)]
 use rand::{RngExt, rng};
 use std::hash::{Hash, Hasher};
 use twox_hash::xxhash64::Hasher as XxHash64;
