@@ -390,6 +390,13 @@ where
                                 break None;
                             }
 
+                            if entry_ref.is_expired() {
+                                let latency = called_at.elapsed().as_millis() as u64;
+                                self.metrics.record_miss();
+                                self.metrics.record_latency(latency);
+                                break None;
+                            }
+
                             if let Err(latest) = slot.tag.compare_exchange_weak(
                                 tag.into(),
                                 tag.increment_frequency().into(),
@@ -898,7 +905,8 @@ mod tests {
     use crate::core::workload::{WorkloadGenerator, WorkloadStatistics};
     use rand::distr::{Alphanumeric, SampleString};
     use rand::{RngExt, rng};
-    use std::thread::scope;
+    use std::thread::{scope, sleep};
+    use std::time::Duration;
 
     #[inline(always)]
     fn create_cache<K, V>(capacity: usize) -> S3FIFOCache<K, V>
@@ -1136,5 +1144,99 @@ mod tests {
             count,
             top_keys_size
         );
+    }
+
+    #[test]
+    fn test_s3cache_ttl_entry_should_expire() {
+        let cache = create_cache(10);
+        let key = random_string();
+        let value = random_string();
+
+        cache.insert(
+            key.clone(),
+            value.clone(),
+            Some(Instant::now() + Duration::from_millis(10)),
+        );
+
+        assert!(cache.get(&key).is_some());
+
+        sleep(Duration::from_millis(50));
+
+        // Should be expired now
+        assert!(cache.get(&key).is_none(), "Entry should have expired");
+    }
+
+    #[test]
+    fn test_s3cache_ttl_entry_should_not_expire_early() {
+        use std::time::Duration;
+        let cache = create_cache(10);
+        let key = "not-expire-me".to_string();
+        let value = "value".to_string();
+
+        cache.insert(
+            key.clone(),
+            value.clone(),
+            Some(Instant::now() + Duration::from_secs(10)),
+        );
+
+        sleep(Duration::from_millis(10));
+
+        assert!(
+            cache.get(&key).is_some(),
+            "Entry should not have expired yet"
+        );
+    }
+
+    #[test]
+    fn test_s3cache_ttl_overwrite_should_update_expiry() {
+        let cache = create_cache(10);
+        let key = random_string();
+
+        cache.insert(
+            key.clone(),
+            "val1".to_string(),
+            Some(Instant::now() + Duration::from_millis(10)),
+        );
+
+        cache.insert(
+            key.clone(),
+            "val2".to_string(),
+            Some(Instant::now() + Duration::from_secs(10)),
+        );
+
+        sleep(Duration::from_millis(50));
+
+        let entry = cache.get(&key);
+        assert!(
+            entry.is_some(),
+            "Entry should still be present with new TTL"
+        );
+        assert_eq!(entry.unwrap().value(), "val2");
+    }
+
+    #[test]
+    fn test_s3cache_expired_entries_should_be_evicted() {
+        let capacity = 10;
+        let cache = create_cache(capacity);
+
+        for _ in 0..capacity {
+            let key = random_string();
+
+            cache.insert(
+                key.clone(),
+                random_string(),
+                Some(Instant::now() + Duration::from_millis(300)),
+            );
+
+            let _ = cache.get(&key);
+        }
+
+        sleep(Duration::from_millis(500));
+
+        let latest_key = random_string();
+
+        cache.insert(latest_key.to_string(), random_string(), None);
+
+        assert!(cache.get(&latest_key).is_some());
     }
 }
