@@ -521,9 +521,11 @@ where
                 Ok(_) => break,
                 Err(_) => {
                     if let Some(index) = self.evict_from_small_queue(|_| true, guard, backoff) {
-                        let Ok(_) = self.index_pool.push(index.into()) else {
-                            unreachable!("")
-                        };
+                        self.index_pool
+                            .push(index.into())
+                            .expect("the index pool can't overflow");
+                    } else {
+                        backoff.backoff();
                     }
                 }
             }
@@ -532,6 +534,15 @@ where
         self.index_table.insert(key, index.into());
     }
 
+    /// Reclaims space from the probationary segment (Small Queue).
+    ///
+    /// This function implements the S3-FIFO admission policy:
+    /// 1. **Promotion**: If an entry has been accessed (`is_hot`), it is moved to the
+    ///    Main Queue and its frequency is reset.
+    /// 2. **Retention**: If the admission policy `allow_eviction` protects the entry,
+    ///    it is re-queued at the back of the Small Queue.
+    /// 3. **Eviction**: If an entry is expired or not valuable, it is moved to the
+    ///    Ghost Queue (tracking its hash) and its slot is returned for reuse.
     fn evict_from_small_queue(
         &self,
         allow_eviction: impl Fn(&K) -> bool,
@@ -540,11 +551,17 @@ where
     ) -> Option<Index> {
         while let Some(index) = self.small_queue.pop().map(Index::from) {
             let slot = &self.slots[index.slot_index()];
-
             let mut tag = Tag::from(slot.tag.load(Acquire));
 
             loop {
+                if tag.is_busy() {
+                    tag = Tag::from(slot.tag.load(Acquire));
+                    backoff.backoff();
+                    continue;
+                }
+
                 let entry = slot.entry.load(Relaxed, guard);
+
                 let entry_ref =
                     unsafe { entry.as_ref().expect("the occupied entry cannot be null") };
 
@@ -599,6 +616,19 @@ where
         None
     }
 
+    /// Records the hash of an evicted entry into the Ghost Queue and Filter.
+    ///
+    /// The Ghost Queue acts as a temporal buffer for recently evicted keys. If a key is
+    /// re-inserted while its hash is still in this queue, it bypasses the Small Queue
+    /// (probation) and is promoted directly to the Main Queue.
+    ///
+    /// ### Mechanism
+    /// * **Admission**: If the `ghost_queue` is full, it performs a FIFO eviction of the
+    ///   oldest hash to make room for the new one.
+    /// * **Consistency**: It maintains a `ghost_filter` (Count-Min Sketch) in sync with
+    ///   the queue to provide fast $O(1)$ membership tests during insertion.
+    /// * **Contention**: Uses the provided `backoff` strategy if the underlying ring
+    ///   buffer is temporarily locked or contended.
     #[inline(always)]
     fn push_into_ghost_queue(&self, key: &K, backoff: &mut Backoff) {
         let hash = hash(key);
@@ -639,6 +669,8 @@ where
                 self.index_pool
                     .push(index.into())
                     .expect("the index pool can't overflow");
+            } else {
+                backoff.backoff();
             }
         }
     }
@@ -686,16 +718,13 @@ where
         };
 
         let slot = &self.slots[index.slot_index()];
-
         let tag = Tag::from(slot.tag.load(Acquire));
 
         let entry = Owned::new(entry);
         let key = entry.key().clone();
 
         slot.entry.store(entry, Relaxed);
-
         let tag = tag.with_signature(hash(key.as_ref()));
-
         slot.tag.store(tag.into(), Release);
 
         loop {
@@ -703,9 +732,11 @@ where
                 Ok(_) => break,
                 Err(_) => {
                     if let Some(index) = self.evict_from_main_queue(|_| true, guard, backoff) {
-                        let Ok(_) = self.index_pool.push(index.into()) else {
-                            unreachable!("")
-                        };
+                        self.index_pool
+                            .push(index.into())
+                            .expect("the index pool can't overflow");
+                    } else {
+                        backoff.backoff();
                     }
                 }
             }
@@ -744,34 +775,27 @@ where
                 }
 
                 let entry = slot.entry.load(Relaxed, guard);
-
-                let entry_ref =
-                    unsafe { entry.as_ref().expect("the occupied entry cannot be null") };
+                let entry_ref = unsafe { entry.as_ref().expect("occupied entry can't be null") };
 
                 // Phase 1 Second-Chance Rotation:
                 // Attempt to decide whether to evict an entry from the queue based on its frequency
                 // and TTL.
-
                 if tag.is_hot() && !entry_ref.is_expired() {
                     let updated_tag = tag.decrement_frequency();
-
-                    match slot.tag.compare_exchange_weak(
-                        tag.into(),
-                        updated_tag.into(),
-                        Release,
-                        Acquire,
-                    ) {
-                        Ok(_) => {
-                            if self.main_queue.push(index.into()).is_ok() {
-                                break;
-                            }
-                            tag = updated_tag;
+                    if slot
+                        .tag
+                        .compare_exchange_weak(tag.into(), updated_tag.into(), Release, Acquire)
+                        .is_ok()
+                    {
+                        // Re-insert to the back. If push fails (rare), we fall through to evict.
+                        if self.main_queue.push(index.into()).is_ok() {
+                            break; // Move to the NEXT index in the 'while' loop
                         }
-                        Err(latest) => {
-                            tag = Tag::from(latest);
-                            backoff.backoff();
-                            continue;
-                        }
+                        tag = updated_tag;
+                    } else {
+                        tag = Tag::from(slot.tag.load(Acquire));
+                        backoff.backoff();
+                        continue;
                     }
                 }
 
@@ -781,41 +805,31 @@ where
                 if !(entry_ref.is_expired() || allow_eviction(entry_ref.key()))
                     && self.main_queue.push(index.into()).is_ok()
                 {
-                    return None;
+                    break;
                 }
 
                 // Phase 3 Eviction:
                 // Attempt to lock the entry for eviction; if locking fails, try to insert the index back into the queue.
+                match slot
+                    .tag
+                    .compare_exchange_weak(tag.into(), tag.busy().into(), AcqRel, Acquire)
+                {
+                    Ok(_) => {
+                        self.index_table.remove(entry_ref.key());
+                        slot.entry.store(Shared::null(), Relaxed);
 
-                loop {
-                    match slot.tag.compare_exchange_weak(
-                        tag.into(),
-                        tag.busy().into(),
-                        AcqRel,
-                        Relaxed,
-                    ) {
-                        Ok(_) => {
-                            let entry = slot.entry.load(Relaxed, guard);
-                            let entry_ref = unsafe { entry.as_ref() }.expect("");
+                        let (next_tag, next_index) = tag.advance(index);
+                        slot.tag.store(next_tag.into(), Release);
 
-                            self.index_table.remove(entry_ref.key());
-                            slot.entry.store(Shared::null(), Relaxed);
-                            unsafe { guard.defer_destroy(entry) };
+                        unsafe { guard.defer_destroy(entry) };
+                        return Some(next_index);
+                    }
+                    Err(latest) => {
+                        tag = Tag::from(latest);
+                        backoff.backoff();
 
-                            let (next_tag, next_index) = tag.advance(index);
-
-                            slot.tag.store(next_tag.into(), Release);
-
-                            return Some(next_index);
-                        }
-                        Err(latest) => {
-                            if self.main_queue.push(index.into()).is_ok() {
-                                break;
-                            }
-
-                            tag = Tag::from(latest);
-                            backoff.backoff();
-                            continue;
+                        if self.main_queue.push(index.into()).is_ok() {
+                            break;
                         }
                     }
                 }
@@ -840,8 +854,8 @@ where
                 let mut tag = Tag::from(slot.tag.load(Relaxed));
 
                 loop {
-                    if tag.is_epoch_match(index) {
-                        break;
+                    if !tag.is_epoch_match(index) {
+                        return false;
                     }
 
                     if let Err(latest) = slot.tag.compare_exchange_weak(
@@ -854,9 +868,9 @@ where
                         backoff.backoff();
                         continue;
                     }
-                }
 
-                true
+                    return true;
+                }
             }
         }
     }
@@ -1073,10 +1087,10 @@ mod tests {
     #[test]
     fn test_s3cache_concurrent_hammer_should_not_crash_or_hang() {
         let cache = create_cache(1000);
-        let num_threads = 8;
-        let ops_per_thread = 10000;
+        let num_threads = 32;
+        let ops_per_thread = 5000;
 
-        std::thread::scope(|s| {
+        scope(|s| {
             for _ in 0..num_threads {
                 s.spawn(|| {
                     for i in 0..ops_per_thread {

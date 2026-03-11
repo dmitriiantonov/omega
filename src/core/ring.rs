@@ -78,6 +78,7 @@ impl RingQueue {
     /// 3. Updates the slot value and publishes it by incrementing the sequence with `Release` ordering.
     pub fn push(&self, value: u64) -> Result<(), u64> {
         let mut tail = self.tail.load(Relaxed);
+        let mut backoff = self.backoff_config.build();
 
         loop {
             let item = &self.buffer[tail & self.mask];
@@ -96,12 +97,16 @@ impl RingQueue {
                             item.sequence.store(tail + 1, Release);
                             return Ok(());
                         }
-                        Err(current_tail) => tail = current_tail,
+                        Err(current_tail) => {
+                            tail = current_tail;
+                            backoff.backoff();
+                        }
                     }
                 }
                 diff if diff < 0 => return Err(value),
                 _ => {
                     tail = self.tail.load(Relaxed);
+                    backoff.backoff();
                 }
             }
         }
@@ -118,6 +123,7 @@ impl RingQueue {
     ///    to future producers (lap + capacity).
     pub fn pop(&self) -> Option<u64> {
         let mut head = self.head.load(Relaxed);
+        let mut backoff = self.backoff_config.build();
 
         loop {
             let item = &self.buffer[head & self.mask];
@@ -137,12 +143,16 @@ impl RingQueue {
                             item.sequence.store(next_sequence, Release);
                             return Some(value);
                         }
-                        Err(current_head) => head = current_head,
+                        Err(current_head) => {
+                            head = current_head;
+                            backoff.backoff();
+                        }
                     }
                 }
                 diff if diff < 0 => return None,
                 _ => {
                     head = self.head.load(Relaxed);
+                    backoff.backoff();
                 }
             }
         }
