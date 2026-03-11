@@ -1,6 +1,6 @@
 [package]
 name = "omega-cache"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 authors = ["Dmitrii Antonov"]
 description = "A high-performance, concurrent cache for Rust with lock-free slot management and pluggable eviction policies."
@@ -18,7 +18,7 @@ crossbeam = "0.8.4"
 dashmap = "7.0.0-rc2"
 twox-hash = "2.1.2"
 fastrand = "2.3.0"
-omega-cache-macros = { path = "macros" }
+omega-cache-macros = { version = "0.2.4", path = "macros" }
 crossbeam-epoch = "0.9.18"
 hdrhistogram = "7.5.4"
 rand_distr = "0.6.0"
