@@ -22,20 +22,15 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Sync and Clean
-        run: |
-          git checkout Cargo.lock
-          git status
-
       - name: Publish macros crate
         working-directory: macros
-        run: cargo publish
+        run: cargo publish --locked
 
       - name: Wait for Crates.io Indexing
         run: sleep 45
 
       - name: Publish main crate
-        run: cargo publish
+        run: cargo publish --locked
 
   release:
     name: Create GitHub Release

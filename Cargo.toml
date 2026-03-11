@@ -1,6 +1,6 @@
 [package]
 name = "omega-cache"
-version = "0.2.1"
+version = "0.2.3"
 edition = "2024"
 authors = ["Dmitrii Antonov"]
 description = "A high-performance, concurrent cache for Rust with lock-free slot management and pluggable eviction policies."
