@@ -26,7 +26,7 @@ pub enum Backoff {
 impl Backoff {
     /// Creates a new linear backoff starting with a maximum spin of 1.
     ///
-    /// At each call to [`backoff`], the internal limit will increase by 1 until `limit` is reached.
+    /// At each call to [`handle_backoff`], the internal limit will increase by 1 until `limit` is reached.
     #[inline]
     pub fn linear(limit: usize) -> Self {
         Self::Linear { current: 1, limit }
@@ -34,7 +34,7 @@ impl Backoff {
 
     /// Creates a new exponential backoff starting with a maximum spin of 1.
     ///
-    /// At each call to [`backoff`], the internal limit will double (multiplicative growth)
+    /// At each call to [`handle_backoff`], the internal limit will double (multiplicative growth)
     /// until `limit` is reached.
     #[inline]
     pub fn exponential(limit: usize) -> Self {
@@ -63,13 +63,21 @@ impl Backoff {
         }
     }
 
+    #[inline]
+    pub fn decay(&mut self) {
+        match self {
+            Self::Linear { current, .. } => *current = current.saturating_sub(1),
+            Self::Exponential { current, .. } => *current = current.saturating_div(2),
+        }
+    }
+
     /// Performs the backoff by spinning the CPU.
     ///
     /// This method:
     /// 1. Generates a random number jitter from 0 to ${limit}.
     /// 2. Executes `std::hint::spin_loop()` jitter times.
     /// 3. Increments the internal limit according to the chosen strategy.
-    pub fn backoff(&mut self) {
+    pub fn wait(&mut self) {
         let limit = self.current_limit();
 
         // Full Jitter: randomize within the [0, limit] range to desynchronize threads.
@@ -139,6 +147,18 @@ impl BackoffConfig {
     }
 }
 
+#[inline(always)]
+pub fn handle_backoff(backoff: Option<&mut Backoff>) {
+    match backoff {
+        None => {
+            spin_loop();
+        }
+        Some(backoff) => {
+            backoff.wait();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,11 +171,11 @@ mod tests {
         assert_eq!(backoff.current_limit(), 1);
 
         // After one backoff, limit should be 2
-        backoff.backoff();
+        backoff.wait();
         assert_eq!(backoff.current_limit(), 2);
 
         // After another, limit should be 3
-        backoff.backoff();
+        backoff.wait();
         assert_eq!(backoff.current_limit(), 3);
     }
 
@@ -166,13 +186,13 @@ mod tests {
         // Initial limit is 1
         assert_eq!(backoff.current_limit(), 1);
 
-        backoff.backoff(); // 1 -> 2
+        backoff.wait(); // 1 -> 2
         assert_eq!(backoff.current_limit(), 2);
 
-        backoff.backoff(); // 2 -> 4
+        backoff.wait(); // 2 -> 4
         assert_eq!(backoff.current_limit(), 4);
 
-        backoff.backoff(); // 4 -> 8
+        backoff.wait(); // 4 -> 8
         assert_eq!(backoff.current_limit(), 8);
     }
 
@@ -180,16 +200,16 @@ mod tests {
     fn test_cap_limit() {
         // Test that linear caps
         let mut lin = Backoff::linear(2);
-        lin.backoff(); // 1 -> 2
-        lin.backoff(); // 2 -> 2 (capped)
+        lin.wait(); // 1 -> 2
+        lin.wait(); // 2 -> 2 (capped)
         assert_eq!(lin.current_limit(), 2);
 
         // Test that exponential caps
         let mut exp = Backoff::exponential(10);
-        exp.backoff(); // 1 -> 2
-        exp.backoff(); // 2 -> 4
-        exp.backoff(); // 4 -> 8
-        exp.backoff(); // 8 -> 10 (capped)
+        exp.wait(); // 1 -> 2
+        exp.wait(); // 2 -> 4
+        exp.wait(); // 4 -> 8
+        exp.wait(); // 8 -> 10 (capped)
         assert_eq!(exp.current_limit(), 10);
     }
 
@@ -198,7 +218,7 @@ mod tests {
         let mut backoff = Backoff::exponential(10);
         // Simple smoke test to ensure no internal panics during execution
         for _ in 0..10 {
-            backoff.backoff();
+            backoff.wait();
         }
     }
 }

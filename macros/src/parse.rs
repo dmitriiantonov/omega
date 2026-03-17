@@ -1,19 +1,18 @@
-use crate::ast::{
-    AdmissionInput, BackoffInput, CacheInput, ClockInput, CountMinSketchInput, EngineInput,
-    FrequentAdmissionInput, MetricsInput, S3FIFOInput,
-};
+use crate::ast::{BackoffInput, CacheInput, ClockInput, EngineInput, MetricsInput, S3FIFOInput};
 use proc_macro2::Ident;
+use std::string::ToString;
 use syn::parse::{Parse, ParseStream};
 use syn::token::Brace;
 use syn::{Error, Expr, Token, braced, parse_quote};
 
 const DEFAULT_SHARDS: usize = 4;
 const DEFAULT_LATENCY_SAMPLES: usize = 1024;
+const DEFAULT_BACKOFF: &str = "{ policy: BackoffPolicy::Linear, limit: 10 }";
 
 impl Parse for CacheInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut engine = None;
-        let mut admission = None;
+        let mut backoff = None;
 
         while !input.is_empty() {
             let key = input.parse::<Ident>()?;
@@ -27,13 +26,12 @@ impl Parse for CacheInput {
                     let value = input.parse::<EngineInput>()?;
                     engine = Some(value);
                 }
-                "admission" => {
-                    if admission.is_some() {
-                        return Err(Error::new(key.span(), "duplicate 'admission' field"));
+                "backoff" => {
+                    if backoff.is_some() {
+                        return Err(Error::new(key.span(), "duplicate 'backoff' field"));
                     }
-
-                    let value = input.parse::<AdmissionInput>()?;
-                    admission = Some(value);
+                    let value = input.parse::<BackoffInput>()?;
+                    backoff = Some(value);
                 }
                 _ => {
                     return Err(Error::new(
@@ -49,129 +47,19 @@ impl Parse for CacheInput {
         }
 
         let engine = engine.ok_or_else(|| Error::new(input.span(), "field 'engine' is missing"))?;
-        let admission =
-            admission.ok_or_else(|| Error::new(input.span(), "field 'admission' is missing"))?;
 
-        Ok(CacheInput {
-            engine,
-            admission_policy: admission,
-        })
-    }
-}
-
-impl Parse for CountMinSketchInput {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        if !input.peek(Brace) {
-            return Err(input.error("missed a braced block"));
-        }
-
-        let content;
-        braced!(content in input);
-
-        let mut width = None;
-        let mut depth = None;
-
-        while !content.is_empty() {
-            let key: Ident = content.parse()?;
-            let _ = content.parse::<Token![:]>();
-
-            match key.to_string().as_str() {
-                "width" => {
-                    if width.is_some() {
-                        return Err(Error::new(key.span(), "duplicate 'width' field"));
-                    }
-
-                    let value = content.parse::<Expr>()?;
-                    width = Some(value)
-                }
-                "depth" => {
-                    if depth.is_some() {
-                        return Err(Error::new(key.span(), "duplicate 'depth' field"));
-                    }
-
-                    let value = content.parse::<Expr>()?;
-                    depth = Some(value)
-                }
-                _ => {
-                    return Err(Error::new(
-                        key.span(),
-                        format!("field '${key}' is not recognized"),
-                    ));
-                }
-            }
-
-            if content.peek(Token![,]) {
-                content.parse::<Token![,]>()?;
-            }
-        }
-
-        let width = width.ok_or_else(|| Error::new(input.span(), "field 'width' is missing"))?;
-        let depth = depth.ok_or_else(|| Error::new(input.span(), "field 'height' is missing"))?;
-
-        Ok(Self { width, depth })
-    }
-}
-
-impl Parse for AdmissionInput {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let admission_type = input.parse::<Ident>()?;
-
-        match admission_type.to_string().as_str() {
-            "Always" => Ok(AdmissionInput::Always),
-            "Frequent" => {
-                if !input.peek(Brace) {
-                    return Err(input.error("missing a braced block"));
-                }
-
-                let content;
-                braced!(content in input);
-
-                let mut count_min_sketch = None;
-                let mut decay_threshold = None;
-
-                while !content.is_empty() {
-                    let key = content.parse::<Ident>()?;
-                    let _ = content.parse::<Token![:]>()?;
-
-                    match key.to_string().as_str() {
-                        "count_min_sketch" => {
-                            let value = content.parse::<CountMinSketchInput>()?;
-                            count_min_sketch = Some(value);
-                        }
-                        "decay_threshold" => {
-                            let value = content.parse::<Expr>()?;
-                            decay_threshold = Some(value);
-                        }
-                        _ => {
-                            return Err(Error::new(
-                                key.span(),
-                                format!("field '${key}' is not recognized"),
-                            ));
-                        }
-                    }
-
-                    if content.peek(Token![,]) {
-                        let _ = content.parse::<Token![,]>()?;
-                    }
-                }
-
-                let count_min_sketch = count_min_sketch.ok_or_else(|| {
-                    Error::new(content.span(), "field 'count_min_sketch' is missing")
-                })?;
-                let decay_threshold = decay_threshold.ok_or_else(|| {
-                    Error::new(content.span(), "field 'decay_threshold' is missing")
+        let backoff = match backoff {
+            Some(backoff) => backoff,
+            None => {
+                let stream: proc_macro2::TokenStream = DEFAULT_BACKOFF.parse().map_err(|_| {
+                    Error::new(input.span(), "Failed to parse DEFAULT_BACKOFF constant")
                 })?;
 
-                Ok(AdmissionInput::Frequent(Box::new(FrequentAdmissionInput {
-                    count_min_sketch,
-                    decay_threshold,
-                })))
+                syn::parse2::<BackoffInput>(stream)?
             }
-            _ => Err(Error::new(
-                admission_type.span(),
-                format!("type '${admission_type}' is not supported"),
-            )),
-        }
+        };
+
+        Ok(CacheInput { engine, backoff })
     }
 }
 
@@ -189,7 +77,6 @@ impl Parse for EngineInput {
                 braced!(content in input);
 
                 let mut capacity = None;
-                let mut backoff = None;
                 let mut metrics = None;
 
                 while !content.is_empty() {
@@ -204,14 +91,6 @@ impl Parse for EngineInput {
 
                             let value = content.parse::<Expr>()?;
                             capacity = Some(value);
-                        }
-                        "backoff" => {
-                            if backoff.is_some() {
-                                return Err(Error::new(key.span(), "field backoff is duplicate"));
-                            }
-
-                            let value = content.parse::<BackoffInput>()?;
-                            backoff = Some(value);
                         }
                         "metrics" => {
                             if metrics.is_some() {
@@ -236,8 +115,6 @@ impl Parse for EngineInput {
 
                 let capacity = capacity
                     .ok_or_else(|| Error::new(content.span(), "field 'capacity' is missing"))?;
-                let backoff = backoff
-                    .ok_or_else(|| Error::new(content.span(), "field 'backoff' is missing"))?;
 
                 let metrics = metrics.unwrap_or_else(|| MetricsInput {
                     shards: parse_quote!(#DEFAULT_SHARDS),
@@ -246,7 +123,6 @@ impl Parse for EngineInput {
 
                 Ok(EngineInput::Clock(Box::new(ClockInput {
                     capacity,
-                    backoff,
                     metrics,
                 })))
             }
@@ -259,7 +135,6 @@ impl Parse for EngineInput {
                 braced!(content in input);
 
                 let mut capacity = None;
-                let mut backoff = None;
                 let mut metrics = None;
 
                 while !content.is_empty() {
@@ -274,14 +149,6 @@ impl Parse for EngineInput {
 
                             let value = content.parse::<Expr>()?;
                             capacity = Some(value);
-                        }
-                        "backoff" => {
-                            if backoff.is_some() {
-                                return Err(Error::new(key.span(), "field backoff is duplicate"));
-                            }
-
-                            let value = content.parse::<BackoffInput>()?;
-                            backoff = Some(value);
                         }
                         "metrics" => {
                             if metrics.is_some() {
@@ -306,8 +173,6 @@ impl Parse for EngineInput {
 
                 let capacity = capacity
                     .ok_or_else(|| Error::new(content.span(), "field 'capacity' is missing"))?;
-                let backoff = backoff
-                    .ok_or_else(|| Error::new(content.span(), "field 'backoff' is missing"))?;
 
                 let metrics = metrics.unwrap_or_else(|| MetricsInput {
                     shards: parse_quote!(#DEFAULT_SHARDS),
@@ -316,7 +181,6 @@ impl Parse for EngineInput {
 
                 Ok(EngineInput::S3FIFO(Box::new(S3FIFOInput {
                     capacity,
-                    backoff,
                     metrics,
                 })))
             }

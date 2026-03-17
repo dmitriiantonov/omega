@@ -10,7 +10,7 @@ TTL support.
 ## 🚀 Overview
 
 Omega Cache is a flexible, concurrent caching library designed for high-performance applications in Rust. It provides a
-generic cache interface with pluggable engines and admission policies, allowing
+generic cache interface with pluggable engines, allowing
 customization for different use cases. The cache supports lock-free operations, efficient memory management using
 epochs, and time-to-live (TTL) for entries.
 
@@ -18,11 +18,9 @@ epochs, and time-to-live (TTL) for entries.
 
 - **🔒 Lock-free slot management**: High concurrency with lock-free data structures, ensuring minimal contention.
 - **⚙️ Pluggable Engines**:
-    - **Clock**: An efficient approximation of LRU using a clock hand.
-    - **S3FIFO**: A state-of-the-art eviction algorithm that combines FIFO queues with a ghost cache for superior hit rates.
-- **🛡️ Admission Policies**: Prevent cache pollution with policies like:
-    - **Frequent**: Uses a Count-Min Sketch to only admit entries that are frequently accessed.
-    - **Always**: Admits all entries.
+    - **Clock**: An efficient approximation of LRU using a clock hand and concurrent state management.
+    - **S3FIFO**: A state-of-the-art eviction algorithm that combines three FIFO queues with a ghost cache for superior
+      hit rates.
 - **♻️ Epoch-based memory reclamation**: Safe and efficient memory management using `crossbeam-epoch`.
 - **⏳ TTL support**: Automatic expiration of cache entries based on time.
 - **📊 High performance**: Multi-sharded metrics and optimized data structures for low-latency.
@@ -41,7 +39,7 @@ omega-cache = "0.2.1"
 
 Omega Cache provides a powerful `cache!` macro to configure cache engines and admission policies.
 
-### 🧩 Example: S3FIFO with Frequent Admission
+### 🧩 Example: S3FIFO Cache
 
 ```rust
 use omega_cache::core::backoff::BackoffPolicy;
@@ -50,13 +48,9 @@ use omega_cache::cache;
 let cache = cache!(
     engine: S3FIFO {
         capacity: 10000,
-        backoff: { policy: BackoffPolicy::Exponential, limit: 10 },
-        metrics: { shards: 8, latency_samples: 1024 }
+        metrics: { shards: 16, latency_samples: 1024 }
     },
-    admission: Frequent {
-        count_min_sketch: { width: 1024, depth: 4 },
-        decay_threshold: 1000
-    }
+    backoff: { policy: BackoffPolicy::Exponential, limit: 10 }
 );
 
 cache.insert("key".to_string(), "value".to_string());
@@ -66,7 +60,7 @@ if let Some(entry) = cache.get(&"key".to_string()) {
 }
 ```
 
-### 🧩 Example: Clock with Always Admission
+### 🧩 Example: Clock Cache
 
 ```rust
 use omega_cache::core::backoff::BackoffPolicy;
@@ -74,11 +68,10 @@ use omega_cache::cache;
 
 let cache = cache!(
     engine: Clock {
-        capacity: 100,
-        backoff: { policy: BackoffPolicy::Linear, limit: 5 },
+        capacity: 1024,
         metrics: { shards: 4, latency_samples: 512 }
     },
-    admission: Always
+    backoff: { policy: BackoffPolicy::Linear, limit: 5 }
 );
 ```
 

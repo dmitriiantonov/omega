@@ -22,3 +22,5 @@ omega-cache-macros = { version = "0.2.4", path = "macros" }
 crossbeam-epoch = "0.9.18"
 hdrhistogram = "7.5.4"
 rand_distr = "0.6.0"
+thread_local = "1.1.9"
+bytes = "1.11.1"

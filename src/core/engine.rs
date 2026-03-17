@@ -1,9 +1,11 @@
+use crate::core::entry::Entry;
 use crate::core::entry_ref::Ref;
 use crate::core::key::Key;
+use crate::core::request_quota::RequestQuota;
+use crate::core::thread_context::ThreadContext;
 use crate::metrics::MetricsSnapshot;
 use std::borrow::Borrow;
 use std::hash::Hash;
-use std::time::Instant;
 
 /// A thread-safe, fixed-capacity caching interface.
 ///
@@ -28,7 +30,7 @@ where
     /// The returned [`Ref`] pins the entry in memory using an epoch guard.
     /// The data will remain valid and allocated until the reference is dropped
     /// and the global epoch advances.
-    fn get<Q>(&self, key: &Q) -> Option<Ref<K, V>>
+    fn get<Q>(&self, key: &Q, context: &ThreadContext) -> Option<Ref<K, V>>
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized;
@@ -38,25 +40,7 @@ where
     /// This is a convenience wrapper around [`insert_with`] that always
     /// admits the new entry. If the cache is full, an existing entry
     /// is evicted based on the engine's internal policy.
-    #[inline]
-    fn insert(&self, key: K, value: V, expired_at: Option<Instant>) {
-        self.insert_with(key, value, expired_at, |_, _| true);
-    }
-
-    /// Inserts a key-value pair with a custom admission policy.
-    ///
-    /// When the cache is full, the `admission` closure is invoked with the
-    /// `(incoming_key, potential_victim_key)`. If the closure returns `false`,
-    /// the insertion is aborted to preserve the current cache state.
-    ///
-    /// # Guarantees
-    /// - **Updates**: If the key already exists, the value is updated and
-    ///   the admission policy is typically bypassed.
-    /// - **Expiration**: Expired entries in a target slot are evicted
-    ///   regardless of the admission policy.
-    fn insert_with<A>(&self, key: K, value: V, expired_at: Option<Instant>, admission: A)
-    where
-        A: Fn(&K, &K) -> bool;
+    fn insert(&self, entry: Entry<K, V>, context: &ThreadContext, quota: &mut RequestQuota);
 
     /// Removes an entry from the cache.
     ///
@@ -67,7 +51,7 @@ where
     /// This method performs an atomic "unlinking." The entry is immediately
     /// made unreachable for new `get` requests, while existing readers
     /// can continue to access the data safely until their [`Ref`] is dropped.
-    fn remove<Q>(&self, key: &Q) -> bool
+    fn remove<Q>(&self, key: &Q, context: &ThreadContext) -> bool
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized;

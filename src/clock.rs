@@ -1,14 +1,14 @@
-use crate::clock::WriteResult::{Rejected, Retry, Written};
-use crate::core::backoff::BackoffConfig;
+use crate::clock::SlotState::{Claimed, Cold, Hot, Vacant};
 use crate::core::engine::CacheEngine;
 use crate::core::entry::Entry;
 use crate::core::entry_ref::Ref;
+use crate::core::index::IndexTable;
 use crate::core::key::Key;
+use crate::core::request_quota::RequestQuota;
+use crate::core::thread_context::ThreadContext;
 use crate::metrics::{Metrics, MetricsConfig, MetricsSnapshot};
-use SlotState::{Claimed, Cold, Hot, Vacant};
 use crossbeam::epoch::{Atomic, Guard, Owned, pin};
 use crossbeam_epoch::Shared;
-use dashmap::DashMap;
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::ptr::NonNull;
@@ -54,16 +54,6 @@ impl From<u8> for SlotState {
             _ => unreachable!("only values 0-3 are supported"),
         }
     }
-}
-
-#[derive(Debug)]
-enum WriteResult<K, V>
-where
-    K: Eq + Hash,
-{
-    Written,
-    Retry(Entry<K, V>),
-    Rejected,
 }
 
 /// A single slot in the Clock cache.
@@ -131,68 +121,6 @@ where
         }
     }
 
-    /// Performs a synchronized write operation on the slot.
-    ///
-    /// This method manages the insertion or replacement of entries using a
-    /// Compare-and-Swap (CAS) on the slot state to prevent race conditions
-    /// between readers and writers.
-    ///
-    /// # Safety
-    /// When an old entry is replaced, its memory is reclaimed via `guard.defer_destroy`
-    /// to ensure any concurrent readers can finish their operations safely.
-    ///
-    /// # Returns
-    /// - `Written`: The new entry was stored.
-    /// - `Rejected`: Admission policy or expiration check denied the write.
-    /// - `Retry`: The slot was hot or claimed; the caller should attempt another slot.
-    fn try_write<A, E, I>(
-        &self,
-        entry: Entry<K, V>,
-        guard: Guard,
-        admission: A,
-        on_evict: E,
-        on_insert: I,
-    ) -> WriteResult<K, V>
-    where
-        A: for<'a> Fn(&'a K, &'a K) -> bool,
-        E: for<'a> FnOnce(&'a Key<K>),
-        I: for<'a> FnOnce(&'a Key<K>),
-    {
-        let state = self.state();
-
-        if !self.is_writable(state, &guard) {
-            if state == Hot {
-                let _ = self.downgrade();
-            }
-
-            return Retry(entry);
-        }
-
-        if !self.claim(state) {
-            return Retry(entry);
-        }
-
-        let shared_current_entry = self.entry.load(Acquire, &guard);
-
-        if let Some(current_entry) = unsafe { shared_current_entry.as_ref() } {
-            if !(current_entry.is_expired() || admission(entry.key(), current_entry.key())) {
-                self.store_state(state);
-                return Rejected;
-            }
-
-            on_evict(current_entry.key());
-            unsafe { guard.defer_destroy(shared_current_entry) };
-        }
-
-        let key = entry.key().clone();
-
-        self.entry.store(Owned::new(entry), Relaxed);
-        on_insert(&key);
-        self.state.store(Cold.into(), Release);
-
-        Written
-    }
-
     #[inline]
     fn is_writable(&self, state: SlotState, guard: &Guard) -> bool {
         let shared_entry = self.entry.load(Acquire, guard);
@@ -255,16 +183,20 @@ where
     }
 }
 
-/// Concurrent fixed-size Clock cache.
+/// An implementation of a concurrent Clock cache.
 ///
-/// Maintains a mapping from keys → slot indices and uses
-/// a clock-hand eviction policy.
+/// The Clock algorithm is an efficient approximation of Least Recently Used (LRU).
+/// It uses a circular "clock hand" to iterate over slots and evict entries that
+/// haven't been recently accessed.
+///
+/// This implementation is lock-free for reads and uses fine-grained state
+/// transitions (Vacant, Cold, Hot, Claimed) for concurrent writes and evictions.
 pub struct ClockCache<K, V>
 where
     K: Eq + Hash,
 {
     /// Key → slot index mapping.
-    index: DashMap<Key<K>, usize>,
+    index: IndexTable<K>,
     /// Fixed-size array of slots.
     slots: Box<[Slot<K, V>]>,
     /// Clock hand for eviction.
@@ -273,7 +205,6 @@ where
     capacity_mask: usize,
     /// Maximum number of elements.
     capacity: usize,
-    backoff_config: BackoffConfig,
     metrics: Metrics,
 }
 
@@ -282,11 +213,7 @@ where
     K: Eq + Hash,
 {
     /// Create a new Clock cache with the given capacity.
-    pub fn new(
-        capacity: usize,
-        backoff_config: BackoffConfig,
-        metrics_config: MetricsConfig,
-    ) -> Self {
+    pub fn new(capacity: usize, metrics_config: MetricsConfig) -> Self {
         let capacity = capacity.next_power_of_two();
 
         let slots = (0..capacity)
@@ -297,25 +224,26 @@ where
         let capacity_mask = capacity - 1;
 
         Self {
-            index: DashMap::new(),
+            index: IndexTable::new(),
             slots,
             hand: Default::default(),
             capacity_mask,
             capacity,
-            backoff_config,
             metrics: Metrics::new(metrics_config),
         }
     }
-}
 
-impl<K, V> CacheEngine<K, V> for ClockCache<K, V>
-where
-    K: Eq + Hash,
-{
-    /// Get a value by key.
+    /// Retrieves a reference to an entry associated with the provided key.
     ///
-    /// Returns a `Handler` that pins the entry in memory.
-    fn get<Q>(&self, key: &Q) -> Option<Ref<K, V>>
+    /// If the entry exists and is valid, its state is upgraded to `Hot` if it was
+    /// `Cold`. This protects the entry from eviction in the next clock cycle.
+    ///
+    /// # Parameters
+    /// * `key`: The key to look up.
+    ///
+    /// # Returns
+    /// Returns `Some(Ref<K, V>)` if the key is found, `None` otherwise.
+    pub fn get<Q>(&self, key: &Q) -> Option<Ref<K, V>>
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
@@ -325,22 +253,19 @@ where
 
         self.index
             .get(key)
-            .and_then(|entry| {
-                let index = *entry.value();
-
-                match self.slots[index].get(key, guard) {
-                    None => {
-                        self.metrics.record_miss();
-                        let elapsed = called_at.elapsed().as_millis() as u64;
-                        self.metrics.record_latency(elapsed);
-                        None
-                    }
-                    Some(reference) => {
-                        self.metrics.record_hit();
-                        let elapsed = called_at.elapsed().as_millis() as u64;
-                        self.metrics.record_latency(elapsed);
-                        Some(reference)
-                    }
+            .map(|index| index as usize)
+            .and_then(|index| match self.slots[index].get(key, guard) {
+                None => {
+                    self.metrics.record_miss();
+                    let elapsed = called_at.elapsed().as_millis() as u64;
+                    self.metrics.record_latency(elapsed);
+                    None
+                }
+                Some(reference) => {
+                    self.metrics.record_hit();
+                    let elapsed = called_at.elapsed().as_millis() as u64;
+                    self.metrics.record_latency(elapsed);
+                    Some(reference)
                 }
             })
             .or_else(|| {
@@ -351,20 +276,23 @@ where
             })
     }
 
-    fn insert_with<F>(&self, key: K, value: V, expired_at: Option<Instant>, admission: F)
-    where
-        F: Fn(&K, &K) -> bool,
-    {
+    /// Inserts a key-value pair into the cache.
+    ///
+    /// If the key already exists, its value is updated. If the cache is full,
+    /// the clock hand advances to find a `Cold` entry to evict. `Hot` entries
+    /// encountered during the search are downgraded to `Cold`.
+    ///
+    /// # Parameters
+    /// * `entry`: The new entry to insert.
+    /// * `quota`: A `RequestQuota` to limit the number of slots inspected during eviction.
+    pub fn insert(&self, entry: Entry<K, V>, quota: &mut RequestQuota) {
         let called_at = Instant::now();
-        let mut entry = Entry::new(key, value, expired_at);
         let mut iter = SlotIter::new(self);
-        let mut backoff = self.backoff_config.build();
 
-        loop {
-            let (index, slot) = match self.index.get(entry.key()) {
+        while quota.consume() {
+            let (index, slot) = match self.index.get(entry.key()).map(|index| index as usize) {
                 None => iter.next().expect("cache has at least one slot"),
-                Some(reference) => {
-                    let index = *reference.value();
+                Some(index) => {
                     let slot = &self.slots[index];
                     (index, slot)
                 }
@@ -372,37 +300,71 @@ where
 
             let guard = pin();
 
-            match slot.try_write(
-                entry,
-                guard,
-                &admission,
-                |key| {
-                    self.index.remove(key);
-                    self.metrics.record_eviction();
-                },
-                |key| {
-                    self.index.insert(key.clone(), index);
-                },
-            ) {
-                Written | Rejected => {
-                    let elapsed = called_at.elapsed().as_millis() as u64;
-                    self.metrics.record_latency(elapsed);
-                    break;
-                }
-                Retry(passed_entry) => {
-                    backoff.backoff();
-                    entry = passed_entry
-                }
-            };
+            let state = slot.state();
+
+            if state == Hot {
+                slot.downgrade();
+                continue;
+            }
+
+            if !(slot.is_writable(state, &guard) && slot.claim(state)) {
+                continue;
+            }
+
+            let entry = Owned::new(entry);
+            let key = entry.key().clone();
+            let victim = slot.entry.swap(entry, Relaxed, &guard);
+
+            if let Some(victim_ref) = unsafe { victim.as_ref() } {
+                self.index.remove(victim_ref.key());
+                unsafe { guard.defer_destroy(victim) };
+                self.metrics.record_eviction();
+            }
+
+            slot.store_state(Cold);
+            self.index.insert(key, index as u64);
+
+            break;
         }
+
+        let elapsed = called_at.elapsed().as_millis() as u64;
+        self.metrics.record_latency(elapsed);
     }
 
-    fn remove<Q>(&self, key: &Q) -> bool
+    /// Removes an entry from the cache.
+    ///
+    /// Returns `true` if the entry was found and successfully removed.
+    pub fn remove<Q>(&self, key: &Q) -> bool
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
         self.index.remove(key).is_some()
+    }
+}
+
+impl<K, V> CacheEngine<K, V> for ClockCache<K, V>
+where
+    K: Eq + Hash,
+{
+    fn get<Q>(&self, key: &Q, _context: &ThreadContext) -> Option<Ref<K, V>>
+    where
+        Key<K>: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        self.get(key)
+    }
+
+    fn insert(&self, entry: Entry<K, V>, _context: &ThreadContext, quota: &mut RequestQuota) {
+        self.insert(entry, quota)
+    }
+
+    fn remove<Q>(&self, key: &Q, _context: &ThreadContext) -> bool
+    where
+        Key<K>: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        self.remove(key)
     }
 
     #[inline]
@@ -498,10 +460,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::utils::{random_string, random_string_with_len};
+    use crate::core::utils::random_string;
     use crate::core::workload::{WorkloadGenerator, WorkloadStatistics};
-    use rand::distr::{Alphanumeric, SampleString};
-    use rand::{RngExt, rng};
+    use rand::rng;
     use std::thread::scope;
     use std::time::{Duration, Instant};
 
@@ -510,26 +471,20 @@ mod tests {
     where
         K: Eq + Hash,
     {
-        ClockCache::new(
-            capacity,
-            BackoffConfig::exponential(1000),
-            MetricsConfig::default(),
-        )
-    }
-
-    #[inline(always)]
-    fn random_alphanumeric(len: usize) -> String {
-        Alphanumeric.sample_string(&mut rand::rng(), len)
+        ClockCache::new(capacity, MetricsConfig::default())
     }
 
     #[test]
     fn test_clock_cache_insert_should_retrieve_stored_value() {
         let cache = create_cache(10);
 
-        let key = random_alphanumeric(32);
-        let value = random_alphanumeric(255);
+        let key = random_string();
+        let value = random_string();
 
-        cache.insert(key.clone(), value.clone(), None);
+        cache.insert(
+            Entry::new(key.clone(), value.clone()),
+            &mut RequestQuota::default(),
+        );
 
         let entry = cache.get(&key).expect("must present");
 
@@ -541,14 +496,20 @@ mod tests {
     fn test_clock_cache_insert_should_overwrite_existing_key() {
         let cache = create_cache(10);
 
-        let key = random_alphanumeric(32);
-        let value1 = random_alphanumeric(255);
-        let value2 = random_alphanumeric(255);
+        let key = random_string();
+        let value1 = random_string();
+        let value2 = random_string();
 
-        cache.insert(key.clone(), value1, None);
-        cache.insert(key.clone(), value2.clone(), None);
+        cache.insert(
+            Entry::new(key.clone(), value1),
+            &mut RequestQuota::default(),
+        );
+        cache.insert(
+            Entry::new(key.clone(), value2.clone()),
+            &mut RequestQuota::default(),
+        );
 
-        let entry = cache.get(&key).expect("must present");
+        let entry = cache.get(&key).expect("entry must present");
 
         assert_eq!(entry.key(), &key);
         assert_eq!(entry.value(), &value2);
@@ -558,9 +519,10 @@ mod tests {
     fn test_clock_cache_remove_should_invalidate_entry() {
         let cache = create_cache(100);
 
-        let key = random_alphanumeric(32);
+        let key = random_string();
+        let value = random_string();
 
-        cache.insert(key.clone(), random_alphanumeric(255), None);
+        cache.insert(Entry::new(key.clone(), value), &mut RequestQuota::default());
 
         assert!(cache.get(&key).is_some());
 
@@ -573,16 +535,19 @@ mod tests {
     fn test_clock_cache_ghost_reference_safety_should_protect_memory() {
         let cache = create_cache(2);
 
-        let key = random_alphanumeric(32);
-        let value = random_alphanumeric(255);
+        let key = random_string();
+        let value = random_string();
 
-        cache.insert(key.clone(), value.clone(), None);
+        cache.insert(
+            Entry::new(key.clone(), value.clone()),
+            &mut RequestQuota::default(),
+        );
 
         let entry_ref = cache.get(&key).expect("key should present");
 
         for _ in 0..10000 {
-            let (key, value) = (random_alphanumeric(32), random_alphanumeric(255));
-            cache.insert(key, value, None);
+            let (key, value) = (random_string(), random_string());
+            cache.insert(Entry::new(key.clone(), value), &mut RequestQuota::default());
         }
 
         assert!(cache.get(&key).is_none());
@@ -594,12 +559,12 @@ mod tests {
     fn test_clock_cache_hot_entry_should_resist_eviction() {
         let cache = create_cache(2);
 
-        cache.insert(1, random_alphanumeric(32), None);
-        cache.insert(2, random_alphanumeric(32), None);
+        cache.insert(Entry::new(1, random_string()), &mut RequestQuota::default());
+        cache.insert(Entry::new(2, random_string()), &mut RequestQuota::default());
 
         let _ = cache.get(&1);
 
-        cache.insert(3, random_alphanumeric(32), None);
+        cache.insert(Entry::new(3, random_string()), &mut RequestQuota::default());
 
         assert!(
             cache.get(&1).is_some(),
@@ -614,14 +579,18 @@ mod tests {
     #[test]
     fn test_clock_cache_ttl_expiration_should_hide_expired_items() {
         let cache = create_cache(10);
-        let short_lived = Duration::from_millis(50);
-        let (key, value) = ("key".to_string(), "value".to_string());
+        let key = random_string();
+        let value = random_string();
 
         cache.insert(
-            key.clone(),
-            value.clone(),
-            Some(Instant::now() + short_lived),
+            Entry::with_expiration(
+                key.clone(),
+                value.clone(),
+                Instant::now() + Duration::from_millis(50),
+            ),
+            &mut RequestQuota::default(),
         );
+
         assert!(cache.get(&key).is_some());
 
         std::thread::sleep(Duration::from_millis(100));
@@ -639,12 +608,13 @@ mod tests {
         let ops_per_thread = 1000;
 
         scope(|s| {
-            for t in 0..num_threads {
+            for thread_id in 0..num_threads {
                 let cache = &cache;
                 s.spawn(move || {
                     for i in 0..ops_per_thread {
-                        let key = (t * 100) + (i % 50); // Mix of private and shared keys
-                        cache.insert(key, i, None);
+                        let key = (thread_id * 100) + (i % 50);
+                        let value = random_string();
+                        cache.insert(Entry::new(key, value), &mut RequestQuota::default());
                         let _ = cache.get(&key);
                         if i % 10 == 0 {
                             cache.remove(&key);
@@ -669,8 +639,11 @@ mod tests {
 
         for _ in 0..capacity {
             let key = workload_generator.key(&mut rand);
-            cache.insert(key.to_string(), random_string(), None);
-            workload_statistics.record(key.to_string());
+            cache.insert(
+                Entry::new(key.clone(), "value"),
+                &mut RequestQuota::default(),
+            );
+            workload_statistics.record(key);
         }
 
         scope(|scope| {
@@ -680,10 +653,12 @@ mod tests {
                     for _ in 0..ops_per_thread {
                         let key = workload_generator.key(&mut rand);
 
-                        if cache.get(key).is_none() {
-                            let value = random_string_with_len(rand.random_range(100..255));
-                            cache.insert(key.to_string(), value, None);
-                            workload_statistics.record(key.to_string());
+                        if cache.get(&key).is_none() {
+                            cache.insert(
+                                Entry::new(key.clone(), "value"),
+                                &mut RequestQuota::default(),
+                            );
+                            workload_statistics.record(key);
                         }
                     }
                 });

@@ -8,5 +8,6 @@ pub mod key;
 pub mod ring;
 pub mod utils;
 
-#[cfg(test)]
+pub mod request_quota;
+pub mod thread_context;
 pub mod workload;
