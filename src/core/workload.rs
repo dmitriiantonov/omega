@@ -1,7 +1,8 @@
-use crate::core::utils::random_string_with_len;
+use crate::core::utils::random_string;
+use bytes::Bytes;
 use dashmap::DashMap;
+use rand::Rng;
 use rand::prelude::*;
-use rand::{Rng, RngExt, rng};
 use rand_distr::Zipf;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
@@ -13,7 +14,7 @@ use std::collections::{BinaryHeap, VecDeque};
 /// where a small subset of "hot" keys receives the majority of traffic.
 pub struct WorkloadGenerator {
     /// The pool of pre-generated random strings.
-    keys: Vec<String>,
+    keys: Vec<Bytes>,
     /// The mathematical distribution used to pick indices from `keys`.
     distribution: Zipf<f64>,
 }
@@ -37,9 +38,7 @@ impl WorkloadGenerator {
             "skew must be in range from 0.5 to 1.5"
         );
 
-        let keys = (0..count)
-            .map(|_| random_string_with_len(rng().random_range(5..=32)))
-            .collect();
+        let keys = (0..count).map(|_| Bytes::from(random_string())).collect();
 
         let distribution = Zipf::new(count as f64, skew).expect("incorrect args");
 
@@ -55,9 +54,9 @@ impl WorkloadGenerator {
     /// This operation is $O(1)$ relative to the size of the key strings but follows
     /// the complexity of the `rand_distr::Zipf` sampling algorithm (typically rejection inversion).
     #[inline(always)]
-    pub fn key<D: Rng>(&self, distribution: &mut D) -> &str {
+    pub fn key<D: Rng>(&self, distribution: &mut D) -> Bytes {
         let index = self.distribution.sample(distribution) as usize - 1;
-        self.keys[index].as_str()
+        self.keys[index].clone()
     }
 }
 
@@ -67,7 +66,7 @@ impl WorkloadGenerator {
 /// This allows tests to compare the cache's internal state against the
 /// mathematically ideal set of frequent items.
 pub struct WorkloadStatistics {
-    counts: DashMap<String, usize>,
+    counts: DashMap<Bytes, usize>,
 }
 
 impl Default for WorkloadStatistics {
@@ -89,7 +88,7 @@ impl WorkloadStatistics {
     ///
     /// In a concurrent test, multiple threads call this to build a global
     /// view of key popularity.
-    pub fn record(&self, key: String) {
+    pub fn record(&self, key: Bytes) {
         let mut entry = self.counts.entry(key).or_default();
         *entry += 1;
     }
@@ -104,7 +103,7 @@ impl WorkloadStatistics {
     /// # Performance
     /// This method is intended for use at the *end* of a test run, as it
     /// iterates over the entire frequency map.
-    pub fn frequent_keys(&self, count: usize) -> Vec<String> {
+    pub fn frequent_keys(&self, count: usize) -> Vec<Bytes> {
         let mut top_frequent = BinaryHeap::new();
 
         for entry in &self.counts {

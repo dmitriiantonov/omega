@@ -34,11 +34,20 @@ where
     /// * `value`: The data to store.
     /// * `expired_at`: An [Instant] in the future when the entry expires, or `None` for no limit.
     #[inline]
-    pub fn new(key: K, value: V, expired_at: Option<Instant>) -> Self {
+    pub fn new(key: K, value: V) -> Self {
         Self {
             key: Key::new(key),
             value,
-            expired_at,
+            expired_at: None,
+        }
+    }
+
+    #[inline(always)]
+    pub fn with_expiration(key: K, value: V, expired_at: Instant) -> Self {
+        Self {
+            key: Key::new(key),
+            value,
+            expired_at: Some(expired_at),
         }
     }
 
@@ -58,17 +67,6 @@ where
     ///
     /// Returns `true` if `expired_at` is a time in the past relative to [Instant::now].
     /// If no expiration was set, this always returns `false`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::time::{Duration, Instant};
-    /// use omega_cache::core::entry::Entry;
-    /// // Entry that expired 1 second ago
-    /// let past = Instant::now() - Duration::from_secs(1);
-    /// let entry = Entry::new("key", "value", Some(past));
-    /// assert!(entry.is_expired());
-    /// ```
     #[inline]
     pub fn is_expired(&self) -> bool {
         self.expired_at

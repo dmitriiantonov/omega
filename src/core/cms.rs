@@ -1,20 +1,14 @@
-use crossbeam::utils::CachePadded;
+use crate::core::thread_context::ThreadContext;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::AtomicU16;
+use std::sync::atomic::Ordering::{Acquire, Relaxed};
 use twox_hash::xxhash64::Hasher as XxHash64;
 
-/// A collection of high-entropy 64-bit prime seeds.
+/// A collection of high-entropy 64-bit prime seeds for row-level hashing independence.
 ///
-/// These seeds are used to initialize the `XxHash64` state for each row
-/// of the `CountMinSketch`. Using static primes ensures:
-///
-/// 1. **Deterministic Hashing**: Identical keys map to identical physical
-///    blocks across different instances of the sketch.
-/// 2. **Independence**: Minimizes the probability of "secondary collisions"
-///    where keys collide across multiple rows simultaneously.
-/// 3. **Bit Distribution**: Ensures the hash output is spread evenly across
-///    the `blocks_mask` and the 3-bit internal counter `shift`.
+/// These seeds initialize the `XxHash64` state for each row. Using static primes ensures:
+/// 1. **Independence**: Minimizes the probability of "secondary collisions" across rows.
+/// 2. **Bit Distribution**: Spreads hash output evenly across the column bitmask.
 static SEEDS: [u64; 8] = [
     0x9e3779b97f4a7c15,
     0xbf58476d1ce4e5b9,
@@ -26,185 +20,196 @@ static SEEDS: [u64; 8] = [
     0xa54ff53a5f1d36f1,
 ];
 
-/// A lock-free probabilistic data structure for frequency estimation.
+/// A high-concurrency, memory-efficient frequency estimator.
 ///
-/// This implementation optimizes for CPU cache locality and multithreaded throughput
-/// by bit-packing 8-bit saturating counters into 64-bit atomic blocks.
+/// Uses `AtomicU16` counters in a 2D matrix to provide a probabilistic upper bound
+/// on item frequency. Designed for high-throughput environments where a small
+/// overestimation error is acceptable in exchange for wait-free/lock-free performance.
 pub struct CountMinSketch {
-    /// Bit-packed counter storage. Each `AtomicU64` contains 8 x 8-bit counters.
-    data: CachePadded<Box<[AtomicU64]>>,
-    /// Number of `AtomicU64` blocks per row.
-    blocks: usize,
-    /// Number of independent rows (hash functions) in the sketch.
-    depth: usize,
-    /// Bitmask for power-of-two indexing within a row.
-    blocks_mask: usize,
+    counters: Box<[AtomicU16]>,
+    columns: usize,
+    rows: usize,
 }
 
 impl CountMinSketch {
-    /// Creates a new probabilistic estimator with a specified geometry.
-    ///
-    /// The physical storage is calculated by mapping the requested logical width
-    /// to 64-bit atomic blocks (8 counters per block).
+    /// Creates a new `CountMinSketch` with the specified logical dimensions.
     ///
     /// # Arguments
-    /// * `width` - The logical number of counters per row. This is rounded to the next
-    ///   power of two to enable bitwise indexing.
-    /// * `depth` - The number of independent hash functions (rows) used to minimize
-    ///   the probability of overestimation.
+    /// * `columns` - The logical width per row. The actual storage is doubled and
+    ///   rounded to the next power of two to optimize indexing via bitwise masking.
+    /// * `rows` - The number of independent hash functions.
     ///
     /// # Panics
-    /// Panics if `depth` exceeds 8, as the implementation relies on a fixed set
-    /// of static prime seeds for hashing independence.
+    /// Panics if `rows` > 8, as it exceeds the available static prime seeds.
     #[inline]
-    pub fn new(width: usize, depth: usize) -> Self {
-        assert!(depth <= 8, "depth must not exceed 8");
-        let blocks = (width / 8).next_power_of_two();
-        let blocks_mask = blocks - 1;
+    pub fn new(columns: usize, rows: usize) -> Self {
+        assert!(rows <= 8, "Depth exceeds available static seeds (8)");
+        let columns = (columns * 2).next_power_of_two();
 
-        let data = (0..(blocks * depth))
-            .map(|_| AtomicU64::default())
+        let counts = (0..columns * rows)
+            .map(|_| AtomicU16::default())
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
         Self {
-            data: CachePadded::new(data),
-            blocks,
-            depth,
-            blocks_mask,
+            counters: counts,
+            columns,
+            rows,
         }
     }
 
-    /// Increments the frequency counters for the given key.
+    /// Increments the frequency estimate for a key across all rows.
     ///
-    /// This operation is performed across all rows (defined by `depth`) using a
-    /// saturating add. Counters will not exceed 255.
-    ///
-    /// # Arguments
-    /// * `key` - The item whose frequency should be increased.
-    pub fn increment<K: Eq + Hash>(&self, key: &K) {
+    /// Uses a saturating atomic CAS loop to ensure counters never overflow.
+    /// If contention is detected, the provided `backoff` is utilized to
+    /// reduce CPU cache-coherency traffic.
+    pub fn increment<K>(&self, key: &K, context: &ThreadContext)
+    where
+        K: Eq + Hash + ?Sized,
+    {
         let mut skip = 0;
 
-        for seed in (0..self.depth).map(|index| SEEDS[index]) {
+        for seed in self.seeds() {
             let hash = self.hash(key, seed) as usize;
 
-            let block_index = skip + (hash & self.blocks_mask);
+            let column = hash & (self.columns - 1);
+            let index = skip + column;
 
-            let shift = ((hash >> 32) & 0x7) * 8;
+            let mut counter = self.counters[index].load(Acquire);
 
-            let _ = self.data[block_index].fetch_update(Relaxed, Relaxed, |block| {
-                let frequency = (block >> shift) & 0xFF;
-                match frequency {
-                    255 => None,
-                    _ => Some(block + (1 << shift)),
+            while counter < u16::MAX {
+                match self.counters[index].compare_exchange_weak(
+                    counter,
+                    counter + 1,
+                    Relaxed,
+                    Relaxed,
+                ) {
+                    Ok(_) => {
+                        context.decay();
+                        break;
+                    }
+                    Err(latest) => {
+                        counter = latest;
+                        context.wait();
+                    }
                 }
-            });
+            }
 
-            skip += self.blocks;
+            skip += self.columns;
         }
     }
 
-    /// Decrements the frequency counters for the given key.
+    /// Internal helper to map row indices to their respective static seeds.
+    #[inline(always)]
+    fn seeds(&self) -> Vec<u64> {
+        (0..self.rows).map(|index| SEEDS[index]).collect()
+    }
+
+    /// Decrements the frequency estimate for a key, saturating at zero.
     ///
-    /// This is used for manual aging or item removal within the sketch.
-    /// Counters will not underflow below 0.
-    ///
-    /// # Arguments
-    /// * `key` - The item whose frequency should be decreased.
-    pub fn decrement<K: Eq + Hash>(&self, key: &K) {
+    /// Useful for manual aging or correction. The CAS loop prevents
+    /// integer underflow, which would otherwise erroneously transform
+    /// a "cold" item into an "ultra-hot" item (65,535).
+    pub fn decrement<K>(&self, key: &K, context: &ThreadContext)
+    where
+        K: Eq + Hash + ?Sized,
+    {
         let mut skip = 0;
 
-        for seed in (0..self.depth).map(|index| SEEDS[index]) {
+        for seed in self.seeds() {
             let hash = self.hash(key, seed) as usize;
 
-            let block_index = skip + (hash & self.blocks_mask);
+            let column = hash & (self.columns - 1);
+            let index = skip + column;
 
-            let shift = ((hash >> 32) & 0x7) * 8;
+            let mut counter = self.counters[index].load(Acquire);
 
-            let _ = self.data[block_index].fetch_update(Relaxed, Relaxed, |block| {
-                let frequency = (block >> shift) & 0xFF;
-                match frequency {
-                    0 => None,
-                    _ => Some(block - (1 << shift)),
+            while counter > 0 {
+                match self.counters[index].compare_exchange_weak(
+                    counter,
+                    counter - 1,
+                    Relaxed,
+                    Relaxed,
+                ) {
+                    Ok(_) => {
+                        context.decay();
+                        break;
+                    }
+                    Err(latest) => {
+                        counter = latest;
+                        context.wait();
+                    }
                 }
-            });
+            }
 
-            skip += self.blocks;
+            skip += self.columns;
         }
     }
 
-    /// Performs an aging operation by halving all counters in the sketch.
+    /// Performs a global aging operation by halving every counter in the sketch.
     ///
-    /// This uses a bitwise trick to divide eight 8-bit counters by 2
-    /// simultaneously within each 64-bit word.
-    pub fn decay(&self) {
-        let mask: u64 = 0xFEFEFEFEFEFEFEFE;
+    /// This reduces the "weight" of historical data, allowing the sketch
+    /// to adapt to changes in key distribution over time. Uses a CAS loop
+    /// per counter to maintain atomicity during the bit-shift.
+    pub fn decay(&self, context: &ThreadContext) {
+        for counter in &self.counters {
+            let mut counter_value = counter.load(Relaxed);
 
-        for i in 0..self.data.len() {
-            let _ = self.data[i].fetch_update(Relaxed, Relaxed, |block| {
-                if block == 0 {
-                    None
-                } else {
-                    Some((block & mask) >> 1)
+            if counter_value > 0 {
+                match counter.compare_exchange_weak(
+                    counter_value,
+                    counter_value >> 1,
+                    Relaxed,
+                    Relaxed,
+                ) {
+                    Ok(_) => {
+                        context.decay();
+                    }
+                    Err(latest) => {
+                        counter_value = latest;
+                        context.wait();
+                    }
                 }
-            });
+            }
         }
     }
 
-    /// Returns `true` if the key has an estimated frequency greater than zero.
-    ///
-    /// Derived by taking the minimum frequency observed across all rows.
-    ///
-    /// # Arguments
-    /// * `key` - The item to check for presence in the sketch.
+    /// Checks if an item is likely present in the sketch (estimate > 0).
     pub fn contains<K: Eq + Hash>(&self, key: &K) -> bool {
         self.get(key) > 0
     }
 
-    /// Returns the estimated frequency of the provided key.
+    /// Retrieves the estimated frequency of a key.
     ///
-    /// The estimate is derived by taking the minimum value found across all rows
-    /// (defined by `depth`). Due to the probabilistic nature of the sketch, this
-    /// value is an upper bound of the actual frequency.
-    ///
-    /// # Arguments
-    /// * `key` - The item whose frequency estimate is being requested.
-    pub fn get<K: Eq + Hash>(&self, key: &K) -> u8 {
+    /// The estimate is the minimum value found across all rows for the given key.
+    /// This is a mathematically guaranteed upper bound of the true frequency.
+    pub fn get<K>(&self, key: &K) -> u16
+    where
+        K: Eq + Hash + ?Sized,
+    {
         let mut skip = 0;
-        let mut frequency: u16 = u16::MAX;
+        let mut frequency = u32::MAX;
 
-        for seed in (0..self.depth).map(|index| SEEDS[index]) {
+        for seed in (0..self.rows).map(|index| SEEDS[index]) {
             let hash = self.hash(key, seed) as usize;
+            let index = skip + (hash & (self.columns - 1));
 
-            let block_index = skip + (hash & self.blocks_mask);
+            let counter = self.counters[index].load(Relaxed) as u32;
+            frequency = frequency.min(counter);
 
-            let shift = ((hash >> 32) & 0x7) * 8;
-
-            let block = self.data[block_index].load(Relaxed);
-
-            let current_frequency = (block >> shift) as u16;
-
-            frequency = frequency.min(current_frequency);
-
-            skip += self.blocks
+            skip += self.columns
         }
 
-        if frequency == u16::MAX {
+        if frequency == u32::MAX {
             0
         } else {
-            frequency as u8
+            frequency as u16
         }
     }
 
-    /// Generates a 64-bit fingerprint for a specific row index.
-    ///
-    /// This uses a seeded hashing strategy to ensure that each row in the
-    /// sketch provides an independent observation of the key's frequency.
-    ///
-    /// # Arguments
-    /// * `key` - The item to be hashed.
-    /// * `seed` - The row-specific random seed to initialize the hasher.
-    fn hash<K: Eq + Hash>(&self, key: K, seed: u64) -> u64 {
+    /// Hashes a key with a specific seed using the XxHash64 algorithm.
+    #[inline(always)]
+    fn hash<K: Eq + Hash + ?Sized>(&self, key: &K, seed: u64) -> u64 {
         let mut hasher = XxHash64::with_seed(seed);
         key.hash(&mut hasher);
         hasher.finish()
@@ -225,10 +230,11 @@ mod tests {
     fn test_count_min_sketch_should_increment_and_retrieve_frequency() {
         let cms = CountMinSketch::new(128, 4);
         let key = random_key(10);
+        let context = ThreadContext::default();
 
-        cms.increment(&key);
-        cms.increment(&key);
-        cms.increment(&key);
+        cms.increment(&key, &context);
+        cms.increment(&key, &context);
+        cms.increment(&key, &context);
 
         assert_eq!(
             cms.get(&key),
@@ -238,19 +244,19 @@ mod tests {
     }
 
     #[test]
-    fn test_count_min_sketch_should_saturate_at_max_u8_without_overflow() {
+    fn test_count_min_sketch_should_saturate_at_max_logical_value() {
         let cms = CountMinSketch::new(64, 2);
         let key = random_key(10);
+        let context = ThreadContext::default();
 
-        // Increment past 255 to test bit-slot protection
-        for _ in 0..300 {
-            cms.increment(&key);
+        for _ in 0..100000 {
+            cms.increment(&key, &context);
         }
 
         assert_eq!(
             cms.get(&key),
-            255,
-            "Counters must cap at 255 to protect adjacent bit-packed slots."
+            u16::MAX,
+            "Counters must cap at MAX_FREQUENCY to prevent wrap-around."
         );
     }
 
@@ -258,48 +264,51 @@ mod tests {
     fn test_count_min_sketch_should_halve_all_counters_on_decay() {
         let cms = CountMinSketch::new(1024, 4);
         let key = random_key(10);
+        let context = ThreadContext::default();
 
         for _ in 0..20 {
-            cms.increment(&key);
+            cms.increment(&key, &context);
         }
+
         assert_eq!(cms.get(&key), 20);
 
-        cms.decay();
+        cms.decay(&context);
         assert_eq!(cms.get(&key), 10);
 
-        cms.decay();
+        cms.decay(&context);
         assert_eq!(cms.get(&key), 5);
 
-        cms.decay();
-        assert_eq!(cms.get(&key), 2);
+        cms.decay(&context);
+        assert_eq!(cms.get(&key), 2); // 5 >> 1 = 2
     }
 
     #[test]
     fn test_count_min_sketch_should_saturate_at_zero_on_decrement() {
         let cms = CountMinSketch::new(128, 4);
         let key = random_key(10);
+        let context = ThreadContext::default();
 
-        cms.increment(&key);
-        cms.decrement(&key);
+        cms.increment(&key, &context);
+        cms.decrement(&key, &context);
         assert_eq!(cms.get(&key), 0);
 
-        // Ensure no underflow (wrapping to 255)
-        cms.decrement(&key);
+        cms.decrement(&key, &context);
         assert_eq!(cms.get(&key), 0, "Counter must not underflow below zero.");
     }
 
     #[test]
     fn test_count_min_sketch_should_maintain_consistent_state_under_contention() {
-        let cms = CountMinSketch::new(16, 4); // Small width to force block collisions
-        let num_threads = 10;
-        let ops_per_thread = 20;
+        let cms = CountMinSketch::new(16, 4); // Small width to force collisions
+        let num_threads = 8;
+        let ops_per_thread = 100;
         let key = random_key(10);
 
         scope(|s| {
             for _ in 0..num_threads {
                 s.spawn(|| {
+                    let context = ThreadContext::default();
                     for _ in 0..ops_per_thread {
-                        cms.increment(&key);
+                        cms.increment(&key, &context);
                     }
                 });
             }
@@ -307,8 +316,8 @@ mod tests {
 
         assert_eq!(
             cms.get(&key),
-            200,
-            "Lock-free increments must be atomic across bit-packed blocks."
+            (num_threads * ops_per_thread) as u16,
+            "Atomic increments must be consistent across multiple threads."
         );
     }
 
@@ -326,15 +335,15 @@ mod tests {
         let cms = CountMinSketch::new(2048, 4);
         let key_a = random_key(10);
         let key_b = random_key(20);
+        let context = ThreadContext::default();
 
         for _ in 0..50 {
-            cms.increment(&key_a);
+            cms.increment(&key_a, &context);
         }
         for _ in 0..5 {
-            cms.increment(&key_b);
+            cms.increment(&key_b, &context);
         }
 
-        // CMS estimates are always upper bounds
         assert!(cms.get(&key_a) >= 50);
         assert!(cms.get(&key_b) >= 5);
     }

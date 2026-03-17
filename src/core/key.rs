@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
@@ -85,6 +86,12 @@ where
 {
     fn borrow(&self) -> &[T] {
         self.0.as_ref().as_slice()
+    }
+}
+
+impl Borrow<[u8]> for Key<Bytes> {
+    fn borrow(&self) -> &[u8] {
+        self.0.as_ref()
     }
 }
 

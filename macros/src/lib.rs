@@ -1,4 +1,4 @@
-use crate::ast::{AdmissionInput, BackoffInput, CacheInput, EngineInput, MetricsInput};
+use crate::ast::{BackoffInput, CacheInput, EngineInput, MetricsInput};
 use proc_macro::TokenStream;
 use quote::{ToTokens, quote};
 use syn::parse_macro_input;
@@ -18,31 +18,11 @@ pub fn cache(input: TokenStream) -> TokenStream {
 impl ToTokens for CacheInput {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
         let engine = &self.engine;
-        let admission_policy = &self.admission_policy;
+        let backoff_config = &self.backoff;
 
         tokens.extend(quote! {
-            crate::Cache::new(#engine, #admission_policy)
+            ::omega_cache::Cache::new(#engine, #backoff_config)
         });
-    }
-}
-
-impl ToTokens for AdmissionInput {
-    fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
-        match self {
-            AdmissionInput::Always => tokens.extend(quote! { crate::AlwaysAdmission::new() }),
-            AdmissionInput::Frequent(frequent) => {
-                let frequent = frequent.as_ref();
-                let cms_width = &frequent.count_min_sketch.width;
-                let cms_height = &frequent.count_min_sketch.depth;
-                let decay_threshold = &frequent.decay_threshold;
-
-                let extend = quote! {
-                    crate::FrequentPolicy::new(#cms_width, #cms_height, #decay_threshold)
-                };
-
-                tokens.extend(extend)
-            }
-        }
     }
 }
 
@@ -51,20 +31,18 @@ impl ToTokens for EngineInput {
         match self {
             EngineInput::Clock(clock) => {
                 let capacity = &clock.capacity;
-                let backoff = &clock.backoff;
                 let metrics = &clock.metrics;
 
                 tokens.extend(quote! {
-                    crate::clock::ClockCache::new(#capacity, #backoff, #metrics)
+                    ::omega_cache::clock::ClockCache::new(#capacity, #metrics)
                 });
             }
             EngineInput::S3FIFO(s3fifo) => {
                 let capacity = &s3fifo.capacity;
-                let backoff = &s3fifo.backoff;
                 let metrics = &s3fifo.metrics;
 
                 tokens.extend(quote! {
-                    crate::s3fifo::S3FIFOCache::new(#capacity, #backoff, #metrics)
+                    ::omega_cache::s3fifo::S3FIFOCache::new(#capacity, #metrics)
                 });
             }
         }
@@ -77,7 +55,7 @@ impl ToTokens for BackoffInput {
         let limit = &self.limit;
 
         let extend = quote! {
-            crate::core::backoff::BackoffConfig { policy: #policy, limit: #limit }
+            ::omega_cache::core::backoff::BackoffConfig { policy: #policy, limit: #limit }
         };
 
         tokens.extend(extend);
@@ -90,7 +68,7 @@ impl ToTokens for MetricsInput {
         let latency_samples = &self.latency_samples;
 
         tokens.extend(quote! {
-            crate::metrics::MetricsConfig::new(#shards, #latency_samples)
+            ::omega_cache::metrics::MetricsConfig::new(#shards, #latency_samples)
         });
     }
 }
