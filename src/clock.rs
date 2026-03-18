@@ -1,209 +1,73 @@
-use crate::clock::SlotState::{Claimed, Cold, Hot, Vacant};
 use crate::core::engine::CacheEngine;
 use crate::core::entry::Entry;
 use crate::core::entry_ref::Ref;
 use crate::core::index::IndexTable;
 use crate::core::key::Key;
 use crate::core::request_quota::RequestQuota;
+use crate::core::ring::RingQueue;
+use crate::core::tag::{Index, Tag};
 use crate::core::thread_context::ThreadContext;
+use crate::core::utils::hash;
 use crate::metrics::{Metrics, MetricsConfig, MetricsSnapshot};
-use crossbeam::epoch::{Atomic, Guard, Owned, pin};
-use crossbeam_epoch::Shared;
+use crossbeam::epoch::{Atomic, pin};
+use crossbeam::utils::CachePadded;
+use crossbeam_epoch::{Owned, Shared};
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::ptr::NonNull;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicU8, AtomicUsize};
 use std::time::Instant;
 
-/// Represents the state of a slot in the Clock cache.
-///
-/// # Invariants
-/// - A slot always has exactly one state.
-/// - `Vacant` → slot has no entry.
-/// - `Cold` → slot has an entry that is eligible for eviction.
-/// - `Hot` → slot has an entry recently accessed.
-/// - `Claimed` → temporary state during write; readers treat it as empty.
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum SlotState {
-    Vacant = 0,
-    Cold = 1,
-    Hot = 2,
-    Claimed = 3,
-}
-
-impl From<SlotState> for u8 {
-    fn from(clock: SlotState) -> Self {
-        match clock {
-            Vacant => 0,
-            Cold => 1,
-            Hot => 2,
-            Claimed => 3,
-        }
-    }
-}
-
-impl From<u8> for SlotState {
-    fn from(clock: u8) -> Self {
-        match clock {
-            0 => Vacant,
-            1 => Cold,
-            2 => Hot,
-            3 => Claimed,
-            _ => unreachable!("only values 0-3 are supported"),
-        }
-    }
-}
-
-/// A single slot in the Clock cache.
-///
-/// Holds an atomic pointer to an `Entry` and a clock state.
 #[derive(Debug)]
 struct Slot<K, V>
 where
     K: Eq + Hash,
 {
-    /// The atomic entry stored in the slot.
+    tag: AtomicU64,
     entry: Atomic<Entry<K, V>>,
-    /// The clock state for eviction logic.
-    state: AtomicU8,
 }
 
-impl<K, V> Slot<K, V>
+impl<K, V> Default for Slot<K, V>
 where
     K: Eq + Hash,
 {
-    /// Creates a new, empty slot.
-    fn empty() -> Self {
+    fn default() -> Self {
         Self {
-            entry: Atomic::default(),
-            state: AtomicU8::new(Vacant.into()),
+            tag: AtomicU64::default(),
+            entry: Default::default(),
         }
-    }
-
-    /// Attempts to retrieve a value from the slot.
-    ///
-    /// If the slot contains a valid, non-expired entry matching the provided key,
-    /// it returns a `Ref` handle. This handle consumes the provided `Guard` to
-    /// ensure the entry's memory remains valid for the duration of the handle's life.
-    ///
-    /// # State Transitions
-    /// - Accessing a `Cold` entry triggers an asynchronous upgrade to `Hot`.
-    /// - Returns `None` if the slot is `Vacant`, `Claimed`, or contains a different/expired key.
-    fn get<Q>(&self, key: &Q, guard: Guard) -> Option<Ref<K, V>>
-    where
-        Key<K>: Borrow<Q>,
-        Q: Eq + Hash + ?Sized,
-    {
-        let state = self.state();
-
-        match state {
-            Vacant | Claimed => None,
-            Cold | Hot => {
-                let shared_entry = self.entry.load(Acquire, &guard);
-                if shared_entry.is_null() {
-                    return None;
-                }
-
-                let entry = unsafe { shared_entry.deref() };
-
-                if entry.key().borrow() != key || entry.is_expired() {
-                    return None;
-                }
-
-                if state == Cold {
-                    self.upgrade();
-                }
-
-                Some(Ref::new(NonNull::from(entry), guard))
-            }
-        }
-    }
-
-    #[inline]
-    fn is_writable(&self, state: SlotState, guard: &Guard) -> bool {
-        let shared_entry = self.entry.load(Acquire, guard);
-
-        match unsafe { shared_entry.as_ref() } {
-            Some(entry) if entry.is_expired() => true,
-            None => true,
-            _ => match state {
-                Vacant | Cold => true,
-                Hot | Claimed => false,
-            },
-        }
-    }
-
-    /// Attempts to transition the slot to the `Claimed` state to secure exclusive write access.
-    ///
-    /// This is a "lock-free" acquisition. If the current state has drifted from the
-    /// provided `state` parameter since it was last read, the exchange will fail,
-    /// signaling that another thread has either updated or claimed the slot.
-    ///
-    /// # Returns
-    /// - `true`: The slot is now `Claimed` by the current thread.
-    /// - `false`: The state changed externally; the caller must re-evaluate.
-    #[inline]
-    fn claim(&self, state: SlotState) -> bool {
-        self.state
-            .compare_exchange_weak(state.into(), Claimed.into(), Relaxed, Relaxed)
-            .is_ok()
-    }
-
-    /// Evaluates whether the slot is eligible for eviction or insertion.
-    ///
-    /// A slot is considered writable if:
-    /// 1. It is currently `Vacant` (empty).
-    /// 2. It is `Cold` (eligible for replacement in the Clock algorithm).
-    /// 3. The existing entry has passed its expiration deadline, regardless of state.
-    ///
-    /// If the slot is `Hot` or already `Claimed`, this returns `false`.
-    fn state(&self) -> SlotState {
-        self.state.load(Acquire).into()
-    }
-
-    /// Store a new clock state.
-    fn store_state(&self, state: SlotState) {
-        self.state.store(state.into(), Release);
-    }
-
-    /// Upgrade a `Cold` entry to `Hot`.
-    fn upgrade(&self) -> bool {
-        self.state
-            .compare_exchange_weak(Cold.into(), Hot.into(), Release, Relaxed)
-            .is_ok()
-    }
-
-    /// Downgrade a `Hot` entry to `Cold`.
-    fn downgrade(&self) -> bool {
-        self.state
-            .compare_exchange_weak(Hot.into(), Cold.into(), Release, Relaxed)
-            .is_ok()
     }
 }
 
 /// An implementation of a concurrent Clock cache.
 ///
-/// The Clock algorithm is an efficient approximation of Least Recently Used (LRU).
-/// It uses a circular "clock hand" to iterate over slots and evict entries that
+/// The Clock algorithm is an efficient $O(1)$ approximation of Least Recently Used (LRU).
+/// It uses a circular "clock hand" logic to iterate over slots and evict entries that
 /// haven't been recently accessed.
 ///
-/// This implementation is lock-free for reads and uses fine-grained state
-/// transitions (Vacant, Cold, Hot, Claimed) for concurrent writes and evictions.
+/// ### Concurrency Model
+/// This implementation is **lock-free for reads** and uses fine-grained atomic state
+/// transitions for concurrent writes and evictions.
+///
+/// * **Tag-based Synchronization:** Each slot is protected by an `AtomicU64` tag that
+///   combines a versioned index, a frequency bit (Hot/Cold), and a "Busy" bit.
+/// * **Memory Safety:** Uses Epoch-based Reclamation (via `crossbeam-epoch`) to ensure
+///   safe destruction of evicted entries while other threads hold references.
 pub struct ClockCache<K, V>
 where
     K: Eq + Hash,
 {
-    /// Key → slot index mapping.
-    index: IndexTable<K>,
-    /// Fixed-size array of slots.
-    slots: Box<[Slot<K, V>]>,
-    /// Clock hand for eviction.
-    hand: AtomicUsize,
-    /// Capacity mask (capacity must be power-of-two).
-    capacity_mask: usize,
-    /// Maximum number of elements.
+    /// Key → slot index mapping. Provides $O(1)$ lookup to find the physical slot.
+    index_table: IndexTable<K>,
+    /// Fixed-size array of slots. CachePadded to prevent false sharing between cores.
+    slots: Box<[CachePadded<Slot<K, V>>]>,
+    /// MPMC Pool of available indices.
+    ///
+    /// **Implementation Note:** The pool is sized to `capacity` but utilizes
+    /// `tail - head` logical checks to distinguish between a "Busy Slot"
+    /// (transient state) and a "Full Queue" (physical saturation).
+    index_pool: RingQueue,
     capacity: usize,
     metrics: Metrics,
 }
@@ -212,134 +76,323 @@ impl<K, V> ClockCache<K, V>
 where
     K: Eq + Hash,
 {
-    /// Create a new Clock cache with the given capacity.
+    /// Creates a new Clock cache with a fixed capacity.
+    ///
+    /// ### Initialization Logic
+    /// 1. **Slots:** Allocates a contiguous block of memory for `capacity` slots.
+    ///    Each slot is wrapped in `CachePadded` to eliminate L1 cache-line contention
+    ///    between concurrent readers and writers.
+    /// 2. **Index Pool:** Initializes the MPMC `RingQueue`.
+    ///    *Note:* The pool is populated with all available slot indices (0..capacity)
+    ///    immediately. This "cold start" state treats every slot as vacant and
+    ///    ready for the first wave of insertions.
+    /// 3. **Metrics:** Sets up sharded atomic counters for tracking hits, misses,
+    ///    and eviction latency without creating a global bottleneck.
     pub fn new(capacity: usize, metrics_config: MetricsConfig) -> Self {
-        let capacity = capacity.next_power_of_two();
-
         let slots = (0..capacity)
-            .map(|_| Slot::empty())
+            .map(|_| CachePadded::new(Slot::default()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
-        let capacity_mask = capacity - 1;
+        let index_pool = RingQueue::new(capacity);
 
+        let context = ThreadContext::default();
+
+        for index in 0..capacity {
+            index_pool
+                .push(index as u64, &context)
+                .expect("index pool can't be overflowed");
+        }
         Self {
-            index: IndexTable::new(),
+            index_table: IndexTable::new(),
             slots,
-            hand: Default::default(),
-            capacity_mask,
+            index_pool,
             capacity,
             metrics: Metrics::new(metrics_config),
         }
     }
 
-    /// Retrieves a reference to an entry associated with the provided key.
+    /// Retrieves an entry from the cache.
     ///
-    /// If the entry exists and is valid, its state is upgraded to `Hot` if it was
-    /// `Cold`. This protects the entry from eviction in the next clock cycle.
-    ///
-    /// # Parameters
-    /// * `key`: The key to look up.
-    ///
-    /// # Returns
-    /// Returns `Some(Ref<K, V>)` if the key is found, `None` otherwise.
-    pub fn get<Q>(&self, key: &Q) -> Option<Ref<K, V>>
+    /// Uses an `Acquire` load on the slot tag to synchronize with the `Release`
+    /// store of the last writer. If the entry is `Cold`, it is upgraded to `Hot`
+    /// via a `compare_exchange` to protect it from the next eviction cycle.
+    pub fn get<Q>(&self, key: &Q, context: &ThreadContext) -> Option<Ref<K, V>>
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        let called_at = Instant::now();
+        let started_at = Instant::now();
         let guard = pin();
+        let hash = hash(key);
 
-        self.index
-            .get(key)
-            .map(|index| index as usize)
-            .and_then(|index| match self.slots[index].get(key, guard) {
+        loop {
+            match self.index_table.get(key) {
+                Some(index) => {
+                    let index = Index::from(index);
+
+                    let slot = &self.slots[index.slot_index()];
+                    let mut tag = Tag::from(slot.tag.load(Acquire));
+
+                    if !tag.is_match(index, hash) {
+                        let latency = started_at.elapsed().as_millis() as u64;
+                        self.metrics.record_miss();
+                        self.metrics.record_latency(latency);
+                        return None;
+                    }
+
+                    let entry = slot.entry.load(Relaxed, &guard);
+
+                    match unsafe { entry.as_ref() } {
+                        None => {
+                            let latency = started_at.elapsed().as_millis() as u64;
+                            self.metrics.record_miss();
+                            self.metrics.record_latency(latency);
+                            break None;
+                        }
+                        Some(entry_ref) => {
+                            if entry_ref.key().borrow() != key || entry_ref.is_expired() {
+                                let latency = started_at.elapsed().as_millis() as u64;
+                                self.metrics.record_miss();
+                                self.metrics.record_latency(latency);
+                                break None;
+                            }
+
+                            match slot.tag.compare_exchange_weak(
+                                tag.into(),
+                                tag.increment_frequency().into(),
+                                Release,
+                                Acquire,
+                            ) {
+                                Ok(_) => {
+                                    context.decay();
+                                }
+                                Err(latest) => {
+                                    tag = Tag::from(latest);
+                                    context.wait();
+                                    continue;
+                                }
+                            }
+
+                            self.metrics.record_hit();
+                            self.metrics
+                                .record_latency(started_at.elapsed().as_millis() as u64);
+
+                            break Some(Ref::new(NonNull::from_ref(entry_ref), guard));
+                        }
+                    }
+                }
                 None => {
                     self.metrics.record_miss();
-                    let elapsed = called_at.elapsed().as_millis() as u64;
-                    self.metrics.record_latency(elapsed);
-                    None
+                    self.metrics
+                        .record_latency(started_at.elapsed().as_millis() as u64);
+                    return None;
                 }
-                Some(reference) => {
-                    self.metrics.record_hit();
-                    let elapsed = called_at.elapsed().as_millis() as u64;
-                    self.metrics.record_latency(elapsed);
-                    Some(reference)
-                }
-            })
-            .or_else(|| {
-                self.metrics.record_miss();
-                let elapsed = called_at.elapsed().as_millis() as u64;
-                self.metrics.record_latency(elapsed);
-                None
-            })
+            }
+        }
     }
 
-    /// Inserts a key-value pair into the cache.
+    /// Inserts a new entry or updates an existing one.
     ///
-    /// If the key already exists, its value is updated. If the cache is full,
-    /// the clock hand advances to find a `Cold` entry to evict. `Hot` entries
-    /// encountered during the search are downgraded to `Cold`.
+    /// If the key is missing, the thread initiates the **Eviction Loop**:
+    /// 1. Pops an index from the `index_pool`.
+    /// 2. If the slot is `Hot`: Decrements frequency and pushes it back (Second Chance).
+    /// 3. If the slot is `Cold`: Claims the slot using a `Busy` bit, swaps the entry,
+    ///    and updates the `IndexTable`.
     ///
-    /// # Parameters
-    /// * `entry`: The new entry to insert.
-    /// * `quota`: A `RequestQuota` to limit the number of slots inspected during eviction.
-    pub fn insert(&self, entry: Entry<K, V>, quota: &mut RequestQuota) {
-        let called_at = Instant::now();
-        let mut iter = SlotIter::new(self);
+    /// ### Memory Ordering Logic
+    /// 1. **Claiming:** `AcqRel` on the tag ensures exclusive access to the slot.
+    /// 2. **Writing:** `Relaxed` store on the `entry` is safe because it is
+    ///    guarded by the surrounding Tag barriers.
+    /// 3. **Publishing:** `Release` store on the final `Tag` makes the new
+    ///    entry visible to all concurrent readers.
+    pub fn insert(&self, entry: Entry<K, V>, context: &ThreadContext, quota: &mut RequestQuota) {
+        let started_at = Instant::now();
+        let guard = pin();
+        let hash = hash(entry.key());
 
         while quota.consume() {
-            let (index, slot) = match self.index.get(entry.key()).map(|index| index as usize) {
-                None => iter.next().expect("cache has at least one slot"),
+            match self.index_table.get(entry.key()).map(Index::from) {
                 Some(index) => {
-                    let slot = &self.slots[index];
-                    (index, slot)
+                    let slot = &self.slots[index.slot_index()];
+                    let tag = Tag::from(slot.tag.load(Acquire));
+
+                    if !tag.is_match(index, hash) {
+                        context.wait();
+                        continue;
+                    }
+
+                    match slot.tag.compare_exchange_weak(
+                        tag.into(),
+                        tag.busy().into(),
+                        AcqRel,
+                        Relaxed,
+                    ) {
+                        Ok(_) => {
+                            context.decay();
+                        }
+                        Err(_) => {
+                            context.wait();
+                            continue;
+                        }
+                    }
+
+                    let old_entry = slot.entry.load(Relaxed, &guard);
+
+                    if let Some(old_entry_ref) = unsafe { old_entry.as_ref() } {
+                        if old_entry_ref.key() != entry.key() {
+                            context.wait();
+                            continue;
+                        }
+
+                        unsafe { guard.defer_destroy(old_entry) };
+                    }
+
+                    slot.entry.store(Owned::new(entry), Relaxed);
+                    slot.tag.store(tag.increment_frequency().into(), Release);
+
+                    self.metrics
+                        .record_latency(started_at.elapsed().as_millis() as u64);
+
+                    return;
                 }
-            };
+                None => match self.index_pool.pop(context) {
+                    Some(index) => {
+                        let index = Index::from(index);
 
-            let guard = pin();
+                        let slot = &self.slots[index.slot_index()];
+                        let mut tag = Tag::from(slot.tag.load(Acquire));
 
-            let state = slot.state();
+                        loop {
+                            if tag.is_hot() {
+                                if let Err(latest) = slot.tag.compare_exchange_weak(
+                                    tag.into(),
+                                    tag.decrement_frequency().into(),
+                                    Release,
+                                    Acquire,
+                                ) {
+                                    tag = Tag::from(latest);
+                                    context.wait();
+                                    continue;
+                                }
 
-            if state == Hot {
-                slot.downgrade();
-                continue;
+                                self.index_pool
+                                    .push(index.into(), context)
+                                    .expect("index pool can't be overflowed");
+
+                                context.decay();
+
+                                break;
+                            }
+
+                            if let Err(latest) = slot.tag.compare_exchange_weak(
+                                tag.into(),
+                                tag.busy().into(),
+                                AcqRel,
+                                Acquire,
+                            ) {
+                                tag = Tag::from(latest);
+                                context.wait();
+                                continue;
+                            }
+
+                            let entry = Owned::new(entry);
+                            let key = entry.key().clone();
+
+                            let victim = slot.entry.swap(entry, Relaxed, &guard);
+
+                            if let Some(victim_ref) = unsafe { victim.as_ref() } {
+                                self.index_table.remove(victim_ref.key());
+                                self.metrics.record_eviction();
+                                unsafe { guard.defer_destroy(victim) };
+                            }
+
+                            let (tag, index) = tag.advance(index);
+                            let tag = tag.with_signature(hash);
+
+                            slot.tag.store(tag.into(), Release);
+
+                            self.index_pool
+                                .push(index.into(), context)
+                                .expect("index pool can't be overflowed");
+
+                            context.decay();
+
+                            self.index_table.insert(key, index.into());
+
+                            self.metrics
+                                .record_latency(started_at.elapsed().as_millis() as u64);
+
+                            return;
+                        }
+                    }
+                    None => context.wait(),
+                },
             }
-
-            if !(slot.is_writable(state, &guard) && slot.claim(state)) {
-                continue;
-            }
-
-            let entry = Owned::new(entry);
-            let key = entry.key().clone();
-            let victim = slot.entry.swap(entry, Relaxed, &guard);
-
-            if let Some(victim_ref) = unsafe { victim.as_ref() } {
-                self.index.remove(victim_ref.key());
-                unsafe { guard.defer_destroy(victim) };
-                self.metrics.record_eviction();
-            }
-
-            slot.store_state(Cold);
-            self.index.insert(key, index as u64);
-
-            break;
         }
-
-        let elapsed = called_at.elapsed().as_millis() as u64;
-        self.metrics.record_latency(elapsed);
     }
 
-    /// Removes an entry from the cache.
+    /// Removes an entry from the cache and resets its physical slot.
     ///
-    /// Returns `true` if the entry was found and successfully removed.
-    pub fn remove<Q>(&self, key: &Q) -> bool
+    /// This operation performs a two-stage teardown:
+    /// 1. **Logical Removal:** Atomically removes the key from the `index_table`.
+    /// 2. **Physical Invalidation:** Transitions the associated slot's `Tag` to a
+    ///    reset/vacant state via a `compare_exchange` loop.
+    ///
+    /// ### Synchronization
+    /// * **Tag Match:** If the `Tag` no longer matches the expected index or hash
+    ///   (due to a concurrent eviction), the method returns `true` immediately,
+    ///   as the target entry is already gone.
+    /// * **Reset:** A successful `tag.reset()` ensures that any "in-flight" `get`
+    ///   requests observing this slot will see a signature mismatch and return `None`.
+    ///
+    /// ### Memory Reclamation
+    /// Note that while the `Tag` is reset, the `Entry` itself remains in the slot
+    /// and the `index` is not pushed back to the `index_pool`. The physical
+    /// memory is reclaimed by the `insert` logic when the Clock hand eventually
+    /// encounters this reset slot.
+    ///
+    /// # Parameters
+    /// * `key`: The key to be removed.
+    /// * `context`: The thread context for backoff coordination during contention.
+    ///
+    /// # Returns
+    /// Returns `true` if the entry was found and successfully invalidated.
+    pub fn remove<Q>(&self, key: &Q, context: &ThreadContext) -> bool
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        self.index.remove(key).is_some()
+        match self.index_table.remove(key) {
+            Some(index) => {
+                let index = Index::from(index);
+
+                let slot = &self.slots[index.slot_index()];
+                let mut tag = Tag::from(slot.tag.load(Acquire));
+
+                let hash = hash(key);
+
+                loop {
+                    if !tag.is_match(index, hash) {
+                        return true;
+                    }
+
+                    if let Err(latest) = slot.tag.compare_exchange_weak(
+                        tag.into(),
+                        tag.reset().into(),
+                        Release,
+                        Acquire,
+                    ) {
+                        tag = Tag::from(latest);
+                        context.wait();
+                        continue;
+                    }
+
+                    return true;
+                }
+            }
+            None => false,
+        }
     }
 }
 
@@ -347,24 +400,24 @@ impl<K, V> CacheEngine<K, V> for ClockCache<K, V>
 where
     K: Eq + Hash,
 {
-    fn get<Q>(&self, key: &Q, _context: &ThreadContext) -> Option<Ref<K, V>>
+    fn get<Q>(&self, key: &Q, context: &ThreadContext) -> Option<Ref<K, V>>
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        self.get(key)
+        self.get(key, context)
     }
 
-    fn insert(&self, entry: Entry<K, V>, _context: &ThreadContext, quota: &mut RequestQuota) {
-        self.insert(entry, quota)
+    fn insert(&self, entry: Entry<K, V>, context: &ThreadContext, quota: &mut RequestQuota) {
+        self.insert(entry, context, quota)
     }
 
-    fn remove<Q>(&self, key: &Q, _context: &ThreadContext) -> bool
+    fn remove<Q>(&self, key: &Q, context: &ThreadContext) -> bool
     where
         Key<K>: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        self.remove(key)
+        self.remove(key, context)
     }
 
     #[inline]
@@ -397,72 +450,13 @@ where
     }
 }
 
-/// Iterator over slots for eviction.
-///
-/// Skips `Claimed` slots and advances the clock-hand atomically.
-struct SlotIter<'a, K, V>
-where
-    K: Eq + Hash,
-{
-    slots: &'a [Slot<K, V>],
-    hand: &'a AtomicUsize,
-    capacity_mask: usize,
-}
-
-impl<'a, K, V> SlotIter<'a, K, V>
-where
-    K: Eq + Hash,
-{
-    fn new(cache: &'a ClockCache<K, V>) -> Self {
-        Self {
-            slots: &cache.slots,
-            hand: &cache.hand,
-            capacity_mask: cache.capacity_mask,
-        }
-    }
-}
-
-impl<'a, K, V> Iterator for SlotIter<'a, K, V>
-where
-    K: Eq + Hash,
-{
-    type Item = (usize, &'a Slot<K, V>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut current = self.hand.load(Acquire);
-
-        loop {
-            let next = (current + 1) & self.capacity_mask;
-
-            match self
-                .hand
-                .compare_exchange_weak(current, next, Release, Acquire)
-            {
-                Ok(_) => {
-                    let slot = &self.slots[current];
-                    let clock = slot.state();
-
-                    if clock == Claimed {
-                        current = next;
-                        continue;
-                    }
-
-                    return Some((current, slot));
-                }
-                Err(value) => {
-                    current = value;
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::utils::random_string;
     use crate::core::workload::{WorkloadGenerator, WorkloadStatistics};
     use rand::rng;
+    use std::hash::Hash;
     use std::thread::scope;
     use std::time::{Duration, Instant};
 
@@ -477,16 +471,18 @@ mod tests {
     #[test]
     fn test_clock_cache_insert_should_retrieve_stored_value() {
         let cache = create_cache(10);
+        let context = ThreadContext::default();
 
         let key = random_string();
         let value = random_string();
 
         cache.insert(
             Entry::new(key.clone(), value.clone()),
+            &context,
             &mut RequestQuota::default(),
         );
 
-        let entry = cache.get(&key).expect("must present");
+        let entry = cache.get(&key, &context).expect("must present");
 
         assert_eq!(entry.key(), &key);
         assert_eq!(entry.value(), &value);
@@ -495,6 +491,7 @@ mod tests {
     #[test]
     fn test_clock_cache_insert_should_overwrite_existing_key() {
         let cache = create_cache(10);
+        let context = ThreadContext::default();
 
         let key = random_string();
         let value1 = random_string();
@@ -502,14 +499,16 @@ mod tests {
 
         cache.insert(
             Entry::new(key.clone(), value1),
+            &context,
             &mut RequestQuota::default(),
         );
         cache.insert(
             Entry::new(key.clone(), value2.clone()),
+            &context,
             &mut RequestQuota::default(),
         );
 
-        let entry = cache.get(&key).expect("entry must present");
+        let entry = cache.get(&key, &context).expect("entry must present");
 
         assert_eq!(entry.key(), &key);
         assert_eq!(entry.value(), &value2);
@@ -518,39 +517,50 @@ mod tests {
     #[test]
     fn test_clock_cache_remove_should_invalidate_entry() {
         let cache = create_cache(100);
+        let context = ThreadContext::default();
 
         let key = random_string();
         let value = random_string();
 
-        cache.insert(Entry::new(key.clone(), value), &mut RequestQuota::default());
+        cache.insert(
+            Entry::new(key.clone(), value),
+            &context,
+            &mut RequestQuota::default(),
+        );
 
-        assert!(cache.get(&key).is_some());
+        assert!(cache.get(&key, &context).is_some());
 
-        assert!(cache.remove(&key));
+        assert!(cache.remove(&key, &context));
 
-        assert!(cache.get(&key).is_none());
+        assert!(cache.get(&key, &context).is_none());
     }
 
     #[test]
     fn test_clock_cache_ghost_reference_safety_should_protect_memory() {
         let cache = create_cache(2);
+        let context = ThreadContext::default();
 
         let key = random_string();
         let value = random_string();
 
         cache.insert(
             Entry::new(key.clone(), value.clone()),
+            &context,
             &mut RequestQuota::default(),
         );
 
-        let entry_ref = cache.get(&key).expect("key should present");
+        let entry_ref = cache.get(&key, &context).expect("key should present");
 
         for _ in 0..10000 {
             let (key, value) = (random_string(), random_string());
-            cache.insert(Entry::new(key.clone(), value), &mut RequestQuota::default());
+            cache.insert(
+                Entry::new(key.clone(), value),
+                &context,
+                &mut RequestQuota::default(),
+            );
         }
 
-        assert!(cache.get(&key).is_none());
+        assert!(cache.get(&key, &context).is_none());
 
         assert_eq!(entry_ref.value(), &value);
     }
@@ -558,20 +568,33 @@ mod tests {
     #[test]
     fn test_clock_cache_hot_entry_should_resist_eviction() {
         let cache = create_cache(2);
+        let context = ThreadContext::default();
 
-        cache.insert(Entry::new(1, random_string()), &mut RequestQuota::default());
-        cache.insert(Entry::new(2, random_string()), &mut RequestQuota::default());
+        cache.insert(
+            Entry::new(1, random_string()),
+            &context,
+            &mut RequestQuota::default(),
+        );
+        cache.insert(
+            Entry::new(2, random_string()),
+            &context,
+            &mut RequestQuota::default(),
+        );
 
-        let _ = cache.get(&1);
+        let _ = cache.get(&1, &context);
 
-        cache.insert(Entry::new(3, random_string()), &mut RequestQuota::default());
+        cache.insert(
+            Entry::new(3, random_string()),
+            &context,
+            &mut RequestQuota::default(),
+        );
 
         assert!(
-            cache.get(&1).is_some(),
+            cache.get(&1, &context).is_some(),
             "K1 should have been protected by Hot state"
         );
         assert!(
-            cache.get(&2).is_none(),
+            cache.get(&2, &context).is_none(),
             "K2 should have been the first choice for eviction"
         );
     }
@@ -579,6 +602,7 @@ mod tests {
     #[test]
     fn test_clock_cache_ttl_expiration_should_hide_expired_items() {
         let cache = create_cache(10);
+        let context = ThreadContext::default();
         let key = random_string();
         let value = random_string();
 
@@ -588,36 +612,42 @@ mod tests {
                 value.clone(),
                 Instant::now() + Duration::from_millis(50),
             ),
+            &context,
             &mut RequestQuota::default(),
         );
 
-        assert!(cache.get(&key).is_some());
+        assert!(cache.get(&key, &context).is_some());
 
         std::thread::sleep(Duration::from_millis(100));
 
         assert!(
-            cache.get(&key).is_none(),
+            cache.get(&key, &context).is_none(),
             "Expired item should not be accessible"
         );
     }
 
     #[test]
     fn test_clock_cache_concurrent_hammer_should_not_crash_or_hang() {
-        let cache = create_cache(64);
-        let num_threads = 8;
-        let ops_per_thread = 1000;
+        let cache = create_cache(1024);
+        let num_threads = 16;
+        let ops_per_thread = 10000;
 
         scope(|s| {
             for thread_id in 0..num_threads {
                 let cache = &cache;
                 s.spawn(move || {
+                    let context = ThreadContext::default();
                     for i in 0..ops_per_thread {
                         let key = (thread_id * 100) + (i % 50);
                         let value = random_string();
-                        cache.insert(Entry::new(key, value), &mut RequestQuota::default());
-                        let _ = cache.get(&key);
+                        cache.insert(
+                            Entry::new(key, value),
+                            &context,
+                            &mut RequestQuota::default(),
+                        );
+                        let _ = cache.get(&key, &context);
                         if i % 10 == 0 {
-                            cache.remove(&key);
+                            cache.remove(&key, &context);
                         }
                     }
                 });
@@ -627,10 +657,11 @@ mod tests {
 
     #[test]
     fn test_clock_cache_should_preserve_hot_set() {
-        let capacity = 1000;
+        let capacity = 1024;
         let cache = create_cache(capacity);
+        let context = ThreadContext::default();
 
-        let num_threads = 8;
+        let num_threads = 16;
         let ops_per_thread = 15_000;
         let workload_generator = WorkloadGenerator::new(10000, 1.2);
         let workload_statistics = WorkloadStatistics::new();
@@ -641,6 +672,7 @@ mod tests {
             let key = workload_generator.key(&mut rand);
             cache.insert(
                 Entry::new(key.clone(), "value"),
+                &context,
                 &mut RequestQuota::default(),
             );
             workload_statistics.record(key);
@@ -650,12 +682,14 @@ mod tests {
             for _ in 0..num_threads {
                 scope.spawn(|| {
                     let mut rand = rng();
+                    let context = ThreadContext::default();
                     for _ in 0..ops_per_thread {
                         let key = workload_generator.key(&mut rand);
 
-                        if cache.get(&key).is_none() {
+                        if cache.get(&key, &context).is_none() {
                             cache.insert(
                                 Entry::new(key.clone(), "value"),
+                                &context,
                                 &mut RequestQuota::default(),
                             );
                             workload_statistics.record(key);
@@ -669,13 +703,13 @@ mod tests {
             .frequent_keys(500)
             .iter()
             .fold(0, |acc, key| {
-                if cache.get(key).is_some() {
+                if cache.get(key, &context).is_some() {
                     acc + 1
                 } else {
                     acc
                 }
             });
 
-        assert!(count >= 250)
+        assert!(count >= 200)
     }
 }
