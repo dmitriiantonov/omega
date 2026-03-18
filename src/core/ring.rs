@@ -1,7 +1,7 @@
 use crate::core::thread_context::ThreadContext;
 use crossbeam::utils::CachePadded;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicU64, AtomicUsize, compiler_fence};
 
 const MIN_CAPACITY: usize = 8;
 
@@ -96,7 +96,15 @@ impl RingQueue {
                         }
                     }
                 }
-                diff if diff < 0 => return Err(value),
+                diff if diff < 0 => {
+                    let head = self.head.load(Relaxed);
+
+                    if tail.wrapping_sub(head) >= self.capacity {
+                        return Err(value);
+                    }
+
+                    context.wait();
+                }
                 _ => {
                     tail = self.tail.load(Relaxed);
                     context.wait();
@@ -130,6 +138,8 @@ impl RingQueue {
                     {
                         Ok(_) => {
                             let value = item.value.load(Relaxed);
+                            compiler_fence(Release);
+
                             let next_sequence = head.wrapping_add(self.capacity);
                             item.sequence.store(next_sequence, Release);
                             context.decay();

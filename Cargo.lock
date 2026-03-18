@@ -341,7 +341,7 @@ dependencies = [
 name = "omega-cache"
 version = "0.2.4"
 dependencies = [
-    "bytes",
+ "bytes",
  "crossbeam",
  "crossbeam-epoch",
  "dashmap",
@@ -350,7 +350,7 @@ dependencies = [
  "omega-cache-macros",
  "rand 0.10.0",
  "rand_distr",
-    "thread_local",
+ "thread_local",
  "twox-hash",
 ]
 
@@ -567,7 +567,7 @@ version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
-    "cfg-if",
+ "cfg-if",
 ]
 
 [[package]]

@@ -9,5 +9,6 @@ pub mod ring;
 pub mod utils;
 
 pub mod request_quota;
+pub mod tag;
 pub mod thread_context;
 pub mod workload;
