@@ -457,7 +457,7 @@ mod tests {
     use crate::core::workload::{WorkloadGenerator, WorkloadStatistics};
     use rand::rng;
     use std::hash::Hash;
-    use std::thread::scope;
+    use std::thread::{scope, sleep};
     use std::time::{Duration, Instant};
 
     #[inline(always)]
@@ -606,24 +606,19 @@ mod tests {
         let key = random_string();
         let value = random_string();
 
+        let ttl = Duration::from_millis(300);
+
         cache.insert(
-            Entry::with_expiration(
-                key.clone(),
-                value.clone(),
-                Instant::now() + Duration::from_millis(50),
-            ),
+            Entry::with_expiration(key.clone(), value.clone(), Instant::now() + ttl),
             &context,
             &mut RequestQuota::default(),
         );
 
         assert!(cache.get(&key, &context).is_some());
 
-        std::thread::sleep(Duration::from_millis(100));
+        sleep(ttl + Duration::from_millis(150));
 
-        assert!(
-            cache.get(&key, &context).is_none(),
-            "Expired item should not be accessible"
-        );
+        assert!(cache.get(&key, &context).is_none());
     }
 
     #[test]

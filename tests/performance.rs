@@ -1,4 +1,4 @@
-#[cfg(test)]
+#[cfg(all(test, feature = "performance"))]
 mod tests {
     use bytes::Bytes;
     use omega_cache::core::backoff::BackoffPolicy;

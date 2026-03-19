@@ -3,7 +3,8 @@
 A high-performance, concurrent cache for Rust, featuring lock-free slot management, epoch-based memory reclamation, and
 TTL support.
 
-[![Omega Cache CI](https://github.com/dmitriiantonov/omega-cache/actions/workflows/ci.yml/badge.svg)](https://github.com/dmitriiantonov/omega-cache/actions/workflows/ci.yml)
+[![Omega Cache CI](https://github.com/dmitriiantonov/omega/actions/workflows/ci.yml/badge.svg)](https://github.com/dmitriiantonov/omega/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/dmitriiantonov/omega/graph/badge.svg?token=OMEGACACHE_TOKEN)](https://codecov.io/gh/dmitriiantonov/omega)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-blue.svg)](https://www.rust-lang.org)
 
@@ -103,6 +104,10 @@ let snapshot = cache.metrics();
 println!("Hit rate: {:.2}%", snapshot.hit_rate() * 100.0);
 println!("P99 Latency: {}ns", snapshot.latency(LatencyPercentile::P99));
 ```
+
+## 🤝 Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## ⚖️ License
 
