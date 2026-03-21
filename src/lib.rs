@@ -15,6 +15,7 @@ pub use omega_cache_macros::cache;
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::time::Duration;
 use thread_local::ThreadLocal;
 
 pub struct Cache<E, K, V>
@@ -61,16 +62,31 @@ where
 
     /// Inserts a key-value pair into the cache.
     ///
-    /// When the cache is full, an eviction candidate is selected by the engine.
-    /// The admission policy then decides whether the incoming entry should
-    /// replace the candidate.
+    /// # Arguments
     ///
-    /// Returns a [`EntryRef`] if an existing entry was replaced.
+    /// * `key` - The key to associate with the value.
+    /// * `value` - The value to be cached.
     pub fn insert(&self, key: K, value: V) {
         let entry = Entry::new(key, value);
 
         self.engine
-            .insert(entry, self.context(), &mut RequestQuota::default())
+            .insert(entry, self.context(), &mut RequestQuota::default());
+    }
+
+    /// Inserts a key-value pair into the cache with a specific Time-to-Live (TTL).
+    ///
+    /// The entry will be automatically considered expired after the specified `ttl`
+    /// duration has elapsed.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to associate with the value.
+    /// * `value` - The value to be cached.
+    /// * `ttl` - The duration for which the entry should remain valid.
+    pub fn insert_with_ttl(&self, key: K, value: V, ttl: Duration) {
+        let entry = Entry::with_ttl(key, value, ttl);
+        self.engine
+            .insert(entry, self.context(), &mut RequestQuota::default());
     }
 
     /// Removes an entry from the cache.
