@@ -1,6 +1,7 @@
 use crate::core::key::Key;
+use std::cmp::Ordering;
 use std::hash::Hash;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A container representing a single cached item.
 ///
@@ -10,7 +11,6 @@ use std::time::Instant;
 /// ### Generic Constraints
 /// * `K`: The raw key type, which must implement [Eq] and [Hash].
 /// * `V`: The type of the value being stored.
-#[derive(Debug)]
 pub struct Entry<K, V>
 where
     K: Eq + Hash,
@@ -20,7 +20,7 @@ where
     /// The value stored in the cache.
     value: V,
     /// An optional timestamp indicating when this entry becomes invalid.
-    expired_at: Option<Instant>,
+    expiration: Expiration,
 }
 
 impl<K, V> Entry<K, V>
@@ -38,16 +38,31 @@ where
         Self {
             key: Key::new(key),
             value,
-            expired_at: None,
+            expiration: Expiration::Never,
         }
     }
 
     #[inline(always)]
-    pub fn with_expiration(key: K, value: V, expired_at: Instant) -> Self {
+    pub fn with_ttl(key: K, value: V, ttl: Duration) -> Self {
         Self {
             key: Key::new(key),
             value,
-            expired_at: Some(expired_at),
+            expiration: Expiration::ttl(ttl),
+        }
+    }
+
+    #[inline(always)]
+    pub fn with_custom_expiration(
+        key: K,
+        value: V,
+        is_expire: impl Fn() -> bool + 'static + Send + Sync,
+    ) -> Self {
+        Self {
+            key: Key::new(key),
+            value,
+            expiration: Expiration::Custom(CustomExpiration {
+                is_expired: Box::new(is_expire),
+            }),
         }
     }
 
@@ -69,7 +84,37 @@ where
     /// If no expiration was set, this always returns `false`.
     #[inline]
     pub fn is_expired(&self) -> bool {
-        self.expired_at
-            .is_some_and(|expired_at| Instant::now() > expired_at)
+        self.expiration.is_expired()
+    }
+}
+
+pub enum Expiration {
+    Never,
+    TTL(Instant),
+    Custom(CustomExpiration),
+}
+
+pub struct CustomExpiration {
+    is_expired: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl Expiration {
+    #[inline(always)]
+    pub fn never() -> Self {
+        Self::Never
+    }
+
+    #[inline(always)]
+    pub fn ttl(ttl: Duration) -> Self {
+        Self::TTL(Instant::now() + ttl)
+    }
+
+    #[inline(always)]
+    pub fn is_expired(&self) -> bool {
+        match self {
+            Expiration::Never => false,
+            Expiration::TTL(deadline) => Instant::now().cmp(deadline) == Ordering::Greater,
+            Expiration::Custom(custom) => (custom.is_expired)(),
+        }
     }
 }

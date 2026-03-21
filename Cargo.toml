@@ -12,6 +12,9 @@ readme = "README.md"
 keywords = ["cache", "concurrent", "lock-free", "s3fifo", "lru"]
 categories = ["caching", "concurrency"]
 
+[features]
+performance = []
+
 [dependencies]
 rand = "0.10.0"
 crossbeam = "0.8.4"
