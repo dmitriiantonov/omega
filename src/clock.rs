@@ -141,7 +141,7 @@ where
                         return None;
                     }
 
-                    let entry = slot.entry.load(Relaxed, &guard);
+                    let entry = slot.entry.load(Acquire, &guard);
 
                     match unsafe { entry.as_ref() } {
                         None => {
@@ -457,8 +457,8 @@ mod tests {
     use crate::core::workload::{WorkloadGenerator, WorkloadStatistics};
     use rand::rng;
     use std::hash::Hash;
-    use std::thread::{scope, sleep};
-    use std::time::{Duration, Instant};
+    use std::sync::{Arc, Mutex};
+    use std::thread::scope;
 
     #[inline(always)]
     fn create_cache<K, V>(capacity: usize) -> ClockCache<K, V>
@@ -606,17 +606,22 @@ mod tests {
         let key = random_string();
         let value = random_string();
 
-        let ttl = Duration::from_millis(300);
+        let expired = Arc::new(Mutex::new(false));
+
+        let is_expired = {
+            let expired = expired.clone();
+            move || *expired.lock().unwrap()
+        };
 
         cache.insert(
-            Entry::with_expiration(key.clone(), value.clone(), Instant::now() + ttl),
+            Entry::with_custom_expiration(key.clone(), value.clone(), is_expired),
             &context,
             &mut RequestQuota::default(),
         );
 
         assert!(cache.get(&key, &context).is_some());
 
-        sleep(ttl + Duration::from_millis(150));
+        *expired.lock().unwrap() = true;
 
         assert!(cache.get(&key, &context).is_none());
     }

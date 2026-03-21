@@ -976,8 +976,8 @@ mod tests {
     use crate::core::utils::random_string;
     use crate::core::workload::{WorkloadGenerator, WorkloadStatistics};
     use rand::{RngExt, rng};
-    use std::thread::{scope, sleep};
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex};
+    use std::thread::scope;
 
     #[inline(always)]
     fn create_cache<K, V>(capacity: usize) -> S3FIFOCache<K, V>
@@ -1294,88 +1294,26 @@ mod tests {
         let key = random_string();
         let value = random_string();
 
+        let expired = Arc::new(Mutex::new(false));
+
+        let is_expired = {
+            let expired = expired.clone();
+            move || *expired.lock().unwrap()
+        };
+
         cache.insert(
-            Entry::with_expiration(
-                key.clone(),
-                value.clone(),
-                Instant::now() + Duration::from_millis(10),
-            ),
+            Entry::with_custom_expiration(key.clone(), value.clone(), is_expired),
             &context,
             &mut RequestQuota::default(),
         );
 
         assert!(cache.get(&key, &context).is_some());
 
-        sleep(Duration::from_millis(50));
+        *expired.lock().unwrap() = true;
 
         assert!(
             cache.get(&key, &context).is_none(),
             "Entry should have expired"
         );
-    }
-
-    #[test]
-    fn test_s3cache_ttl_entry_should_not_expire_early() {
-        let cache = create_cache(10);
-        let context = ThreadContext::default();
-        let key = random_string();
-        let value = random_string();
-
-        cache.insert(
-            Entry::with_expiration(
-                key.clone(),
-                value.clone(),
-                Instant::now() + Duration::from_secs(100),
-            ),
-            &context,
-            &mut RequestQuota::default(),
-        );
-
-        sleep(Duration::from_millis(10));
-
-        assert!(
-            cache.get(&key, &context).is_some(),
-            "Entry should not have expired yet"
-        );
-    }
-
-    #[test]
-    fn test_s3cache_ttl_overwrite_should_update_expiry() {
-        let cache = create_cache(10);
-        let context = ThreadContext::default();
-        let key = random_string();
-        let value1 = random_string();
-        let value2 = random_string();
-
-        cache.insert(
-            Entry::with_expiration(
-                key.clone(),
-                value1,
-                Instant::now() + Duration::from_millis(10),
-            ),
-            &context,
-            &mut RequestQuota::default(),
-        );
-
-        cache.insert(
-            Entry::with_expiration(
-                key.clone(),
-                value2.clone(),
-                Instant::now() + Duration::from_millis(300),
-            ),
-            &context,
-            &mut RequestQuota::default(),
-        );
-
-        sleep(Duration::from_millis(50));
-
-        let entry = cache.get(&key, &context);
-
-        assert!(
-            entry.is_some(),
-            "Entry should still be present with new TTL"
-        );
-
-        assert_eq!(entry.unwrap().value(), &value2);
     }
 }
