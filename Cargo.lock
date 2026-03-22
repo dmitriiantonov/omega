@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "omega-cache"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
  "crossbeam",
@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "omega-cache-macros"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "proc-macro2",
  "quote",
